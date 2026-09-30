@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "function_id": "periodic",
+  "revision": "periodic-00001",
+  "instance_id": "example-process-1",
+  "request_id": "run1-1",
+  "request_kind": "user",
+  "started_at": "2026-10-01T00:00:00Z",
+  "service_ms": 12.3,
+  "first_user_request": true,
+  "init_ms": 0
+}

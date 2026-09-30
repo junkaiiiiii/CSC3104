@@ -1,0 +1,7 @@
+{
+  "function_id": "periodic",
+  "bucket_start": "2026-10-01T00:00:00Z",
+  "interval_seconds": 30,
+  "invocation_count": 6,
+  "complete": true
+}

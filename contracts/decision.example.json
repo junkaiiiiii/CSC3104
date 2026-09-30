@@ -1,0 +1,9 @@
+{
+  "function_id": "periodic",
+  "decided_at": "2026-10-01T00:00:30Z",
+  "forecast_generated_at": "2026-10-01T00:00:30Z",
+  "target_warm_replicas": 1,
+  "lead_time_ms": 5000,
+  "reason": "positive demand; within experiment budget",
+  "dry_run": true
+}

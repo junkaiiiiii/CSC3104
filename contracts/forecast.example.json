@@ -1,0 +1,18 @@
+{
+  "function_id": "periodic",
+  "generated_at": "2026-10-01T00:00:30Z",
+  "history_end": "2026-10-01T00:00:30Z",
+  "interval_seconds": 30,
+  "model": "moving-average",
+  "predictions": [
+    {
+      "bucket_start": "2026-10-01T00:00:30Z",
+      "invocation_count": 6
+    },
+    {
+      "bucket_start": "2026-10-01T00:01:00Z",
+      "invocation_count": 6
+    }
+  ],
+  "valid_until": "2026-10-01T00:01:30Z"
+}
