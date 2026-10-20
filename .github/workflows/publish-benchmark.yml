@@ -1,0 +1,52 @@
+name: Publish benchmark image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-benchmark
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check benchmark measurement semantics
+        run: python scripts/smoke_benchmark.py
+      - name: Set up architecture emulation
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish both architectures
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: functions/benchmark
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/junkaiiiiii/csc3104-benchmark:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/junkaiiiiii/CSC3104
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Record image reference
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          echo "Image tag: ghcr.io/junkaiiiiii/csc3104-benchmark:sha-$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pinned image: ghcr.io/junkaiiiiii/csc3104-benchmark@$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          echo "Platforms built: linux/amd64, linux/arm64. Runtime smoke check ran on the runner host; cluster pull and container checks remain required." >> "$GITHUB_STEP_SUMMARY"
