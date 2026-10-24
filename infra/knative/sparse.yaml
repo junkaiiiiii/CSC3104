@@ -1,0 +1,35 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: sparse
+  namespace: csc3104
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/class: kpa.autoscaling.knative.dev
+        autoscaling.knative.dev/min-scale: "0"
+        autoscaling.knative.dev/max-scale: "4"
+    spec:
+      containerConcurrency: 1
+      containers:
+        - image: ghcr.io/junkaiiiiii/csc3104-benchmark@sha256:b410b379a4a333380a57dfd4e35cd87d9ddc0ca57ea50c0db99bc2ba99e01bbc
+          ports:
+            - containerPort: 8080
+          env:
+            - name: FUNCTION_ID
+              value: sparse
+            - name: INIT_DELAY_MS
+              value: "0"
+            - name: WORK_DELAY_MS
+              value: "0"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
