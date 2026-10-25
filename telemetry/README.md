@@ -47,3 +47,20 @@ Output goes to `telemetry/data/<run_id>/` (git-ignored; keep large raw data outs
 - Warmups stay out of demand but are kept for overhead accounting. Probes are never emitted by the function.
 - Dedup key is `(function_id, request_id)`; request IDs must be unique per run.
 - Every input line is accounted for exactly once; a run with `conservation_ok: false` must be rejected.
+
+## CORE-16: run validation
+
+After a replay, check that the run's measurements are trustworthy before analysing it:
+
+```bash
+cd telemetry
+python3 -m collector.validate --run-dir ../results/<run>        # telemetry files in the same dir
+python3 -m collector.validate --run-dir ../results/<run> --telemetry-dir data/<collector-run>
+```
+
+Reads `run_manifest.json` + `client_measurements.jsonl` (evaluation harness) and the collector
+artifacts, writes `telemetry_validation.json` (status, error/warning codes, file SHA-256s).
+Exit code 0 = pass, 1 = fail, 2 = unusable input. Errors reject the run (lost or unattributed
+telemetry, incomplete buckets in the window, late/conflicting events, collector not cleanly
+finished or not covering the run, bucket sums off, unknown pods). Warnings are reported only
+(pre-run pods, pods alive at end, slow termination). It never repairs data.
