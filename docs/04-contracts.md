@@ -23,3 +23,8 @@ Use a monotonic clock for durations, UTC for correlation. A timeout remains in t
 
 ## Integration acceptance
 Each component accepts and emits a sample; event and forecast identifiers remain stable; request-kind exclusions are tested; schema changes have a version and coordinated review. Reconcile missing client or server records rather than claiming all first-use requests are cold starts.
+
+## Pod lifecycle observation (PROPOSED v1, needs review by Hasan and Isaac)
+Sample: contracts/pod_lifecycle.example.json. Written by telemetry/ from `kubectl get pods`; not yet agreed.
+Fields: schema_version, observed_at (collector clock, about the poll interval of lag), event (pod_seen, pod_ready, pod_unready, pod_terminating, pod_gone), function_id, revision, pod, created_at, ready_at, deletion_timestamp and deletion_grace_period_s (set once termination is requested), phase, cpu/memory requests and limits (summed over all containers, including Knative's queue-proxy; null if unset).
+Replica time is derived offline, not stored. deletion_timestamp is when Kubernetes will force-kill the pod (termination request + grace period), NOT when termination began: the request time is deletion_timestamp minus deletion_grace_period_s (about the pod_terminating observation). Ready interval = ready_at to the termination request. Provisioned interval = created_at to the pod_gone observation. A pod that is slow to exit stays provisioned, and holds resources, for the whole grace period. The report must say which definition it uses. Actual CPU/memory usage is not recorded because the platform has no metrics-server; absence means unknown.

@@ -5,7 +5,7 @@ import json
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from . import dedup
 from .buckets import COUNTED, DemandAggregator
@@ -16,6 +16,7 @@ RAW = "raw_events.jsonl"
 BUCKETS = "demand_buckets.jsonl"
 QUARANTINE = "quarantine.jsonl"
 STATS = "collector_stats.jsonl"
+LIFECYCLE = "pod_lifecycle.jsonl"
 MANIFEST = "telemetry_manifest.json"
 
 
@@ -42,10 +43,12 @@ class Collector:
         self._agg = None
         self._event_clock = None
         self._started = time.time()
+        if clock == "wall":
+            self._agg = self._new_agg(self._started)
         self.writer.write_json(MANIFEST, self._manifest(final=False))
 
     # -- ingestion ---------------------------------------------------------
-    def process_line(self, line, wall_now=None) -> str:
+    def process_line(self, line, wall_now=None, pod=None) -> str:
         line = line.strip()
         if not line:
             return "blank"
@@ -70,9 +73,7 @@ class Collector:
             self._event_clock = event_epoch
         now = self._now(wall_now)
         if self._agg is None:
-            self._agg = DemandAggregator(self.functions, _utc(
-                self._started if self.clock == "wall" else event_epoch),
-                self.interval_s, self.grace_s)
+            self._agg = self._new_agg(event_epoch)
 
         verdict = self.deduper.check(event, now)
         if verdict != dedup.NEW:
@@ -83,8 +84,11 @@ class Collector:
             outcome = self._agg.add(function_id, started_at)  # counted | late
         self.totals[outcome] += 1
         counters[outcome] += 1
-        self.writer.append(RAW, {"received_at": format_ts(_utc(now)),
-                                 "outcome": outcome, "source": self.source, "event": event})
+        raw = {"received_at": format_ts(_utc(now)), "outcome": outcome,
+               "source": self.source, "event": event}
+        if pod:
+            raw["pod"] = pod
+        self.writer.append(RAW, raw)
         self._advance(now)
         return outcome
 
@@ -97,14 +101,24 @@ class Collector:
         if self._agg is not None:
             self._agg.mark_gap(start, end, function_id)
 
+    def record_lifecycle(self, record: dict) -> None:
+        self.totals["pod_events"] += 1
+        self.writer.append(LIFECYCLE, record)
+
     # -- output ------------------------------------------------------------
-    def close(self, wall_now=None) -> bool:
+    def close(self, wall_now=None, flush=False) -> bool:
         """Finalise what the watermark allows and write the manifest.
-        Returns the conservation check result."""
+        flush=True (wall clock) also finalises the bucket in progress, marked
+        complete=false because observation stops now. Returns the conservation check."""
         wall_now = time.time() if wall_now is None else wall_now
         if self._agg is not None:
             if self.clock == "event":
                 edge = self._agg.floor(_utc(self._event_clock)).timestamp()
+                self._advance(edge + self.interval_s + self.grace_s)
+            elif flush:
+                stop = _utc(wall_now)
+                self._agg.mark_gap(stop, stop + timedelta(seconds=2 * self.interval_s))
+                edge = self._agg.floor(stop).timestamp()
                 self._advance(edge + self.interval_s + self.grace_s)
             else:
                 self._advance(wall_now)
@@ -124,6 +138,9 @@ class Collector:
                 and t["counted"] == t["emitted_invocations"] + pending)
 
     # -- internals ---------------------------------------------------------
+    def _new_agg(self, start_epoch: float) -> DemandAggregator:
+        return DemandAggregator(self.functions, _utc(start_epoch), self.interval_s, self.grace_s)
+
     def _now(self, wall_now: float) -> float:
         return wall_now if self.clock == "wall" else self._event_clock
 
