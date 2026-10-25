@@ -8,3 +8,6 @@ kubeconfig*
 results/
 !evaluation/results-example/
 .DS_Store
+
+# telemetry run output (store large raw data outside git)
+telemetry/data/
