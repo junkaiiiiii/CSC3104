@@ -18,5 +18,7 @@ jobs:
           python -c "import json,pathlib; [json.loads(p.read_text()) for p in pathlib.Path('contracts').glob('*.json')]"
       - name: Check measurement semantics
         run: python scripts/smoke_benchmark.py
+      - name: Test evaluation harness
+        run: python -m unittest evaluation.tests.test_evaluation
       - name: Build benchmark image
         run: docker build -t csc3104-benchmark:ci functions/benchmark
