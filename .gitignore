@@ -11,3 +11,4 @@ results/
 
 # telemetry run output (store large raw data outside git)
 telemetry/data/
+predictor/data/
