@@ -23,5 +23,10 @@ jobs:
       - name: Scheduler tests
         working-directory: scheduler
         run: python -m unittest discover -s tests -t .
+      - name: Telemetry tests
+        working-directory: telemetry
+        run: python -m unittest discover -s tests -t .
+      - name: Predictor tests
+        run: python -m unittest discover -s predictor/test -t .
       - name: Build benchmark image
         run: docker build -t csc3104-benchmark:ci functions/benchmark
