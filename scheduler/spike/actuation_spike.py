@@ -126,16 +126,19 @@ class Spike:
         self.set_min_scale(method, revision, "1", original)
         result["patched_at"] = now_iso()
         ready_ms = None
+        reverted = False
+        watched = "pa_min_scale" if method == "pa" else "revision_min_scale"
         while time.monotonic() - t0 < ready_timeout_s:
             rec = self.log(trial_id, "warming", t0, revision)
+            if method != "service" and rec[watched] != "1":
+                reverted = True          # a controller put the old value back
             if (rec.get("ready_pods") or 0) >= 1:
                 ready_ms = rec["t_ms"]
                 break
             time.sleep(self.poll_s)
         result["patch_to_ready_ms"] = ready_ms
 
-        held, reverted, hold_end = True, False, time.monotonic() + hold_s
-        watched = "pa_min_scale" if method == "pa" else "revision_min_scale"
+        held, hold_end = True, time.monotonic() + hold_s
         while ready_ms is not None and time.monotonic() < hold_end:
             rec = self.log(trial_id, "holding", t0, revision)
             if (rec.get("ready_pods") or 0) < 1:
@@ -149,15 +152,20 @@ class Spike:
 
         t1 = time.monotonic()
         self.set_min_scale(method, revision, original, original)
-        zero_ms = None
+        # Two release times: Ready capacity gone (what the scheduler controls) and the
+        # pod object gone (Terminating can take minutes; it still holds its requests).
+        zero_ms = unready_ms = None
         while time.monotonic() - t1 < zero_timeout_s:
             rec = self.log(trial_id, "releasing", t0, revision)
+            elapsed = round((time.monotonic() - t1) * 1000, 1)
+            if unready_ms is None and (rec.get("ready_pods") or 0) == 0:
+                unready_ms = elapsed
             if rec.get("pods") == 0:
-                zero_ms = round((time.monotonic() - t1) * 1000, 1)
+                zero_ms = elapsed
                 break
             time.sleep(1)
         after = self.revisions()
-        result.update(release_to_zero_ms=zero_ms, revisions_after=after,
+        result.update(release_to_unready_ms=unready_ms, release_to_zero_ms=zero_ms, revisions_after=after,
                       new_revisions=sorted(set(after) - set(before)),
                       active_revision_after=self.active_revision(), ended_at=now_iso())
         return result
@@ -194,7 +202,7 @@ def main(argv=None):
                 trials.append(result)
                 print(json.dumps({k: result.get(k) for k in (
                     "trial", "patch_to_ready_ms", "held_through_stable_window",
-                    "annotation_reverted", "release_to_zero_ms", "new_revisions", "error")}),
+                    "annotation_reverted", "release_to_unready_ms", "release_to_zero_ms", "new_revisions", "error")}),
                     file=sys.stderr, flush=True)
     summary = {}
     for method in methods:
@@ -208,6 +216,7 @@ def main(argv=None):
             "all_held": all(t.get("held_through_stable_window") for t in ok) if ok else None,
             "any_reverted": any(t.get("annotation_reverted") for t in ok),
             "new_revisions": sorted({r for t in ok for r in t.get("new_revisions", [])}),
+            "release_to_unready_ms": [t.get("release_to_unready_ms") for t in ok],
             "release_to_zero_ms": [t.get("release_to_zero_ms") for t in ok],
         }
     summary_doc = {"function_id": args.function, "namespace": args.namespace,

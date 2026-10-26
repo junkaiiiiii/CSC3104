@@ -25,8 +25,8 @@ MODES = ("binary", "capacity")
 @dataclass
 class PolicyConfig:
     interval_seconds: int = 30
-    # p95 of decision -> Ready capacity plus a margin. Placeholder until the CORE-04
-    # spike measures it (docs/decisions/0001-knative-actuation.md).
+    # Measured p95 patch -> Ready capacity was 2032 ms (cached image, kind on a laptop),
+    # plus a ~3 s margin. Source: docs/decisions/0001-knative-actuation.md.
     lead_time_ms: int = 5000
     tick_seconds: float = 5.0
     per_function_cap: int = 2          # experiment setting (docs/03-architecture.md)

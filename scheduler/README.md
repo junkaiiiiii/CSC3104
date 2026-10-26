@@ -25,11 +25,11 @@ A line is rejected if any `input_buckets_used` entry is not before `forecast_buc
 | Binary mode (1 warm replica) and capacity mode (Little's law, capped) | Implemented, unit-tested |
 | Min-scale adapter (Revision or PodAutoscaler), restore, crash recovery, failure backoff, revert detection | Implemented, tested against a fake cluster only (CORE-10) |
 | Warm-up request actuator (fallback option D) | Implemented, tested with a fake HTTP opener |
-| Actuation spike script | Written, **not yet run on a cluster** (CORE-04) |
-| Actuation decision record | [docs/decisions/0001](../docs/decisions/0001-knative-actuation.md), **Proposed, results pending** |
+| Actuation spike script | Run on the kind cluster, 26 Oct (CORE-04) |
+| Actuation decision record | [docs/decisions/0001](../docs/decisions/0001-knative-actuation.md), **Accepted**: Revision min-scale, p95 patch→Ready 2.0 s |
 | Live end-to-end run with predictor and evaluation harness | Not done; needs the predictor (CORE-07) and the spike result |
 
-No cluster measurements exist yet. The 5000 ms lead time is a placeholder until the spike measures patch→Ready.
+The 5000 ms lead time is the spike's p95 patch→Ready (2.0 s) plus a margin. The scheduler loop itself has not yet run against the live cluster.
 
 ## Run
 Standard library only (Python 3.9+). From `scheduler/`:

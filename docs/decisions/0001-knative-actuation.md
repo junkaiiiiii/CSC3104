@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed. Waiting for spike measurements.** Do not run `--actuator min-scale` in experiments until this says Accepted. |
+| Status | **Accepted (26 Oct 2026).** Option A: set min-scale on the active Revision. Measured on the local kind cluster, image cached. |
 | Lead | Isaac (with Vania, Hasan) |
 | Platform | Knative Serving v1.23.0, Kourier v1.23.0, Kubernetes v1.35.8 on kind (see infra/VERSIONS.md) |
 | Spike tool | `scheduler/spike/actuation_spike.py` |
@@ -33,14 +33,27 @@ python -m spike.actuation_spike --kube-context kind-csc3104 --function steady \
 ```
 Each trial starts from zero pods, sets min-scale=1, times **patch → first Ready pod**, holds 90s (longer than the 60s stable window) watching for pod loss and annotation reverts, restores the original value, times **release → zero pods**, and compares the revision list before and after. Method order alternates between trials. Raw files: `samples.jsonl`, `trials.jsonl`, `summary.json`. Store them outside git and record a link and hash here.
 
-## Results (fill in from summary.json)
-| Method | Trials | Patch→Ready p50 / p95 (ms) | Held 90s? | Reverted? | New revisions | Release→zero (ms) |
-|---|---|---|---|---|---|---|
-| A. Revision | | | | | | |
-| B. PA | | | | | | |
-| C. Service | | | | | | |
+## Results
+Two spike runs on 26 Oct 2026 (function `periodic`, revision `periodic-00001`, hold 90s, Isaac's laptop, Windows + Docker Desktop + kind). Option C was not run; Knative documents that template changes create revisions.
 
-Image cached on node: yes / no. Raw data link and SHA-256:
+| Method | Trials | Patch→Ready (ms) | p50 / p95 (ms) | Held 90s? | Reverted? | New revisions | Ready→0 after restore | Pod object gone |
+|---|---|---|---|---|---|---|---|---|
+| **A. Revision** | 6 | 956, 1627, 2056, 1819, 1958, 1843 | **1831 / 2032** | **6/6 yes** | **never** | **none** | ≤ 1 s (first sample) | > 300 s (Terminating; timed out) |
+| B. PA | 5 | Ready in 2 of 5 (1860, 1755); no pod in 3 | n/a | **0/2**: lost at ~62 s | **always**, within 0.4 s | none | ≤ 1 s | ~269 s |
+
+What the samples show (`samples.jsonl`):
+- **A:** the Revision annotation reaches the PA within one sample (about 0.1–0.4 s). PA desired/actual scale go to 1 and stay at 1 for the whole hold. After the restore, desired/actual/Ready all drop to 0 at the first sample. The pod object then stays `Terminating` for minutes, the same slow termination seen in CORE-03.
+- **B:** the Revision reconciler copies the Revision's annotations back onto the PA, so the patched value returns to 0 within 0.4 s. KPA sometimes starts a pod from the brief desired=1. That pod is removed when the stable window ends (~62 s), and in other trials the pod disappears immediately. Not usable.
+- The active revision stayed `periodic-00001` throughout; `kubectl get ksvc` afterwards still shows it as LATESTREADY.
+
+Image cached on node: **yes** (later trials of a warm cluster). Uncached starts will be slower and must be measured separately.
+
+The first spike version only checked for reverts during the hold, so B trials with no Ready pod were logged as `annotation_reverted: false`. The samples show the revert, and the script now also checks while warming. It also now records `release_to_unready_ms` separately from `release_to_zero_ms`.
+
+Raw data: `results/spike1/` on Isaac's machine (git-ignored; two runs appended to the same files). Share it outside git and record the link here. SHA-256 at time of writing (the second run was still appending):
+- samples.jsonl `a0396c48d6c9bd082cbfb493f8f2bd152f9a164e0bf8e1013de75f5f1b4c9f90`
+- trials.jsonl `ba63ac867972f3432a247731890a9dfd5c9781b2cea2043689c0b4c8254a0200`
+- summary.json (first run) `de0ff1d8afa370f044e43727f8a5e53a5cb75cfa4c6b02cef19864a3767f888a`
 
 ## Decision rule
 Pick the first of A, B that has, across every trial: a Ready pod after the patch, the pod held for the whole hold, no revert, **no new revisions**, and a return to zero after restore. Then:
@@ -51,7 +64,11 @@ Pick the first of A, B that has, across every trial: a Ready pod after the patch
 If neither A nor B passes, fall back to D (`--actuator warmup`), say in the report that it shows predictive *activation*, not replica control, and count warm-up requests and their pods as overhead. C is never used by the scheduler.
 
 ## Decision
-_Pending spike results._
+**Option A: merge-patch `autoscaling.knative.dev/min-scale` on the active Revision** (`--actuator min-scale --target revision`, the adapter default). It passed every criterion in all 6 trials. Option B is rejected: Knative reverts it. Option C is never used. Option D stays as the documented fallback only.
+
+**Lead time:** p95 patch→Ready = 2032 ms. The scheduler keeps `lead_time_ms = 5000`, which is p95 plus a ~3 s margin for scheduler tick jitter, API latency and slower starts. This is for cached images on this laptop; re-measure on any other host.
+
+**Resource accounting consequence:** the scheduler releases Ready capacity within about a second, but the pod object (and its CPU/memory requests) stays for minutes while Terminating. The evaluation must count provisioned time up to `pod_gone` (telemetry contract), not just Ready time, for every policy.
 
 ## Safety behaviour already in the adapter (CORE-10)
 - It only patches Revision or PA metadata. It never edits the Service, so it never creates revisions.
@@ -69,11 +86,12 @@ All namespace-scoped to `csc3104`. No create or delete on anything.
 | API group | Resource | Verbs | Why |
 |---|---|---|---|
 | serving.knative.dev | services | get, list | Find the active revision |
-| serving.knative.dev | revisions | get, list, patch (patch only if A is chosen) | Read and set min-scale |
-| autoscaling.internal.knative.dev | podautoscalers | get, list, patch (patch only if B is chosen) | Read and set min-scale |
+| serving.knative.dev | revisions | get, list, patch | Read and set min-scale (option A chosen) |
+| autoscaling.internal.knative.dev | podautoscalers | get, list | Read only, for observing desired/actual scale. No patch, since B was rejected |
 | "" (core) | pods | get, list | Observe Ready capacity |
 
 ## Limitations
 - One single-node kind cluster with cached images. Patch→Ready times will differ on other hardware or with uncached images.
-- Changing PA annotations (option B) depends on an internal Knative API that may change between versions.
+- Measured on one function, one revision and one machine, with 6 trials. The p95 from 6 samples is rough; add trials before the final report.
+- Release→zero (pod fully gone) exceeded the 300s timeout for every A trial, so its exact value is unknown. Re-run with `--zero-timeout 600` to measure it.
 - The 30s buckets and 5s tick limit how early capacity can be prepared. The lead time comes from measurement, not theory.
