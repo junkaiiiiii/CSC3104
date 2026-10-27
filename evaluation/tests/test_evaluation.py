@@ -7,7 +7,9 @@ from pathlib import Path
 
 from evaluation.analyze import analyze, summarize_run
 from evaluation.common import iso_utc, parse_utc, sha256_file, write_json, write_jsonl
-from evaluation.replay import replay
+from evaluation.correlate import (classify_exposure, exposure_summary, idle_replica_seconds,
+                                  scheduling_lag_summary)
+from evaluation.replay import replay, validate_metadata
 from evaluation.workload import generate, generate_trace
 
 
@@ -126,6 +128,112 @@ class EvaluationTests(unittest.TestCase):
             generate(temp, seed=3, duration_s=5)
             with self.assertRaises(FileExistsError):
                 generate(temp, seed=3, duration_s=5)
+
+
+class CorrelationTests(unittest.TestCase):
+    T0 = "2026-01-01T00:00:{:02d}Z"
+
+    def lifecycle(self):
+        return [
+            {"event": "pod_ready", "pod": "p1", "function_id": "f", "observed_at": self.T0.format(10)},
+            {"event": "pod_gone", "pod": "p1", "function_id": "f", "observed_at": self.T0.format(20)},
+        ]
+
+    def request(self, sent, done, **extra):
+        return {"function_id": "f", "request_kind": "user", "sent_at": self.T0.format(sent),
+                "completed_at": self.T0.format(done), "scheduled_at": self.T0.format(sent), **extra}
+
+    def test_exposure_labels_and_na_latency(self):
+        rows = [self.request(5, 6, latency_ms=900.0), self.request(12, 13, latency_ms=10.0),
+                self.request(15, 16, request_kind="warmup")]
+        labels = classify_exposure(rows, self.lifecycle())
+        self.assertEqual(labels, ["exposed", "not_exposed", "warmup"])
+        summary = exposure_summary(rows, labels)
+        self.assertEqual(summary["exposed_latency_ms"]["p95"], 900.0)
+        none_exposed = exposure_summary(rows[1:2], ["not_exposed"])
+        self.assertEqual(none_exposed["exposed_latency_ms"]["status"], "N/A")
+        self.assertEqual(classify_exposure(rows[:1], []), ["unknown"])
+
+    def test_idle_time_excludes_busy_replica_time(self):
+        rows = [self.request(12, 14)]
+        idle = idle_replica_seconds(rows, self.lifecycle(), parse_utc(self.T0.format(0)),
+                                    parse_utc(self.T0.format(30)))
+        self.assertEqual(idle["total"], 8.0)
+        self.assertIsNone(idle_replica_seconds(rows, [], parse_utc(self.T0.format(0)),
+                                               parse_utc(self.T0.format(30))))
+
+    def test_scheduling_lag(self):
+        row = self.request(5, 6)
+        row["scheduled_at"] = "2026-01-01T00:00:04.500Z"
+        lag = scheduling_lag_summary([row, {"function_id": "f"}])
+        self.assertEqual((lag["n"], lag["unmeasured"], lag["max"]), (1, 1, 500.0))
+
+
+class RunDesignTests(unittest.TestCase):
+    GOOD = {"image_digest": "sha256:abc", "kubernetes_version": "1.30", "knative_version": "1.15",
+            "hardware": "4 vCPU", "image_cache_state": "cached", "initial_replicas": {"periodic": 0}}
+
+    def test_metadata_validation(self):
+        self.assertEqual(validate_metadata(self.GOOD, "reactive"), [])
+        self.assertTrue(validate_metadata({}, "reactive"))
+        warm = dict(self.GOOD, initial_replicas={"periodic": 1})
+        self.assertTrue(validate_metadata(warm, "predictive"))
+        self.assertEqual(validate_metadata(warm, "fixed_minimum"), [])
+
+    def test_strict_replay_rejects_incomplete_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write_jsonl(root / "trace.jsonl", [{"scheduled_at_s": 0, "function_id": "periodic", "request_id": "a"}])
+            write_json(root / "endpoints.json", {"periodic": {"url": "http://127.0.0.1:1/"}})
+            write_json(root / "meta.json", self.GOOD)
+            with self.assertRaisesRegex(ValueError, "incomplete run metadata"):
+                replay(root / "trace.jsonl", root / "endpoints.json", "reactive", "r1", root / "out",
+                       require_metadata=True)
+            with self.assertRaisesRegex(ValueError, "controller-dir"):
+                replay(root / "trace.jsonl", root / "endpoints.json", "predictive", "r2", root / "out",
+                       metadata_path=root / "meta.json", require_metadata=True)
+
+    def make_run(self, root, policy, seed, run_id, started, with_trace_gap=False):
+        run = root / run_id
+        run.mkdir()
+        write_jsonl(run / "trace.jsonl", [
+            {"scheduled_at_s": 0, "function_id": "f", "request_id": "a"},
+            {"scheduled_at_s": 1, "function_id": "f", "request_id": "b"}])
+        rows = [{"request_id": f"{run_id}-a", "trace_request_id": "a", "function_id": "f",
+                 "request_kind": "user", "scheduled_at": started, "sent_at": started,
+                 "completed_at": started, "latency_ms": 5.0, "status_code": 200, "timeout": False,
+                 "first_user_request": False}]
+        if not with_trace_gap:
+            rows.append(dict(rows[0], request_id=f"{run_id}-b", trace_request_id="b"))
+        write_jsonl(run / "client_measurements.jsonl", rows)
+        write_json(run / "run_manifest.json", {
+            "run_id": run_id, "policy": policy, "seed": seed, "request_count": len(rows),
+            "trace_sha256": sha256_file(run / "trace.jsonl"),
+            "measurements_sha256": sha256_file(run / "client_measurements.jsonl"),
+            "started_at": started, "ended_at": "2026-01-01T01:00:00Z", "metadata": {}})
+        return run
+
+    def test_missing_client_records_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = self.make_run(Path(temp), "reactive", 1, "gap", "2026-01-01T00:00:00Z", True)
+            with self.assertRaisesRegex(ValueError, "no client record"):
+                summarize_run(run)
+
+    def test_require_telemetry_and_warnings_and_charts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runs = [self.make_run(root, policy, 1, f"{policy}-1", f"2026-01-01T00:0{i}:00Z")
+                    for i, policy in enumerate(("reactive", "predictive"))]
+            with self.assertRaisesRegex(ValueError, "pod_lifecycle"):
+                summarize_run(runs[0], require_telemetry=True)
+            analyze(runs, root / "analysis")
+            summary = json.loads((root / "analysis/summary.json").read_text())
+            text = " ".join(summary["warnings"])
+            self.assertIn("repetitions", text)
+            self.assertIn("order cannot be checked", text)
+            self.assertIn("predictive run has no controller artifacts", text)
+            self.assertTrue((root / "analysis/p95_latency.svg").read_text().startswith("<svg"))
+            self.assertIn("## Warnings", (root / "analysis/report.md").read_text())
 
 
 if __name__ == "__main__":

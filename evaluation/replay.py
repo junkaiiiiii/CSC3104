@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .common import git_revision, iso_utc, read_jsonl, sha256_file, write_json, write_jsonl
+from .common import git_revision, iso_utc, parse_utc, read_jsonl, sha256_file, write_json, write_jsonl
 
 POLICIES = ("reactive", "fixed_minimum", "predictive")
 
@@ -98,12 +98,51 @@ def _send_one(event: dict, endpoint: dict, run_id: str, scheduled_at: str,
         "instance_id": body.get("instance_id"),
         "revision": body.get("revision"),
         "first_user_request": body.get("first_user_request"),
+        "request_kind": event.get("request_kind", "user"),
+        "scheduling_lag_ms": None,
+        "init_ms": body.get("init_ms"),
+        "service_ms": body.get("service_ms"),
     }
+
+
+REQUIRED_METADATA = ("image_digest", "kubernetes_version", "knative_version", "hardware", "image_cache_state")
+CACHE_STATES = ("cached", "uncached")
+CONTROLLER_FILES = ("scheduler_manifest.json", "decisions.jsonl", "actuation.jsonl")
+
+
+def validate_metadata(metadata: dict, policy: str) -> list[str]:
+    """Return the problems that make a run's environment record insufficient for comparison."""
+    problems = [f"missing metadata: {key}" for key in REQUIRED_METADATA
+                if metadata.get(key) in (None, "", {}, [])]
+    state = metadata.get("image_cache_state")
+    if state not in (None, "") and state not in CACHE_STATES:
+        problems.append(f"image_cache_state must be one of {', '.join(CACHE_STATES)}")
+    initial = metadata.get("initial_replicas")
+    if not isinstance(initial, dict) or not initial:
+        problems.append("missing metadata: initial_replicas (function_id -> pod count before the run)")
+    elif any(not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in initial.values()):
+        problems.append("initial_replicas values must be non-negative integers")
+    elif policy != "fixed_minimum" and any(v != 0 for v in initial.values()):
+        problems.append("reactive/predictive runs must start from zero replicas (reset state first)")
+    elif policy == "fixed_minimum" and any(v < 1 for v in initial.values()):
+        problems.append("fixed_minimum runs must start with at least one replica per function")
+    return problems
+
+
+def _copy_controller_artifacts(controller_dir: str | Path, output_dir: Path) -> dict:
+    source = Path(controller_dir)
+    copied = {}
+    for name in CONTROLLER_FILES:
+        if (source / name).is_file():
+            shutil.copyfile(source / name, output_dir / name)
+            copied[name] = sha256_file(output_dir / name)
+    return copied
 
 
 def replay(trace_path: str | Path, endpoints_path: str | Path, policy: str, run_id: str,
            output_root: str | Path, max_workers: int = 16, timeout_s: float = 30,
-           policy_config_path: str | Path | None = None, metadata_path: str | Path | None = None) -> Path:
+           policy_config_path: str | Path | None = None, metadata_path: str | Path | None = None,
+           require_metadata: bool = False, controller_dir: str | Path | None = None) -> Path:
     if policy not in POLICIES:
         raise ValueError(f"policy must be one of {', '.join(POLICIES)}")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", run_id):
@@ -118,6 +157,15 @@ def replay(trace_path: str | Path, endpoints_path: str | Path, policy: str, run_
     trace_manifest = _load_object(trace_manifest_path) if trace_manifest_path.exists() else {}
     policy_config = _load_object(policy_config_path) if policy_config_path else {}
     metadata = _load_object(metadata_path) if metadata_path else {}
+    if require_metadata:
+        problems = validate_metadata(metadata, policy)
+        if policy == "predictive":
+            if not controller_dir or not (Path(controller_dir) / "scheduler_manifest.json").is_file():
+                problems.append("predictive runs need --controller-dir containing scheduler_manifest.json")
+        if problems:
+            raise ValueError("incomplete run metadata: " + "; ".join(problems))
+    if controller_dir and not (Path(controller_dir) / "scheduler_manifest.json").is_file():
+        raise ValueError(f"{controller_dir}: no scheduler_manifest.json")
     trace_request_ids = set()
     for event in events:
         if (not isinstance(event.get("scheduled_at_s"), (int, float))
@@ -171,6 +219,10 @@ def replay(trace_path: str | Path, endpoints_path: str | Path, policy: str, run_
             record["seed"] = trace_manifest.get("seed")
             results.append(record)
     results.sort(key=lambda record: (record["scheduled_at"], record["request_id"]))
+    for record in results:
+        record["scheduling_lag_ms"] = round(max(0.0, (
+            parse_utc(record["sent_at"]) - parse_utc(record["scheduled_at"])).total_seconds() * 1000), 3)
+    controller_files = _copy_controller_artifacts(controller_dir, output_dir) if controller_dir else {}
     measurements_path = output_dir / "client_measurements.jsonl"
     write_jsonl(measurements_path, results)
 
@@ -193,6 +245,8 @@ def replay(trace_path: str | Path, endpoints_path: str | Path, policy: str, run_
         "ended_at": iso_utc(),
         "code_revision": git_revision(),
         "metadata": metadata,
+        "metadata_validated": bool(require_metadata),
+        "controller_artifacts": controller_files,
         "replay": {"max_workers": max_workers, "timeout_seconds": timeout_s},
         "measurements_file": measurements_path.name,
         "measurements_sha256": sha256_file(measurements_path),
@@ -208,14 +262,18 @@ def main(argv=None) -> int:
     parser.add_argument("--endpoints", required=True, help="JSON object: function_id -> {url, host?, headers?}")
     parser.add_argument("--policy", choices=POLICIES, required=True)
     parser.add_argument("--policy-config", help="JSON description of externally deployed policy settings")
-    parser.add_argument("--metadata", help="JSON metadata: image digest, cluster, hardware, manifest, etc.")
+    parser.add_argument("--metadata", help="JSON metadata: image digest, versions, hardware, cache state, initial replicas")
+    parser.add_argument("--allow-incomplete-metadata", action="store_true",
+                        help="skip the required-metadata and controller-artifact checks (not comparable runs)")
+    parser.add_argument("--controller-dir", help="scheduler output dir (scheduler_manifest.json etc.); required for predictive")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--output", default="results")
     parser.add_argument("--max-workers", type=int, default=16)
     parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args(argv)
     output = replay(args.trace, args.endpoints, args.policy, args.run_id, args.output,
-                    args.max_workers, args.timeout, args.policy_config, args.metadata)
+                    args.max_workers, args.timeout, args.policy_config, args.metadata,
+                    require_metadata=not args.allow_incomplete_metadata, controller_dir=args.controller_dir)
     print(f"Recorded measurements and manifest in {output}")
     return 0
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,15 @@ def parse_utc(value: str) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError(f"timestamp must include a timezone: {value}")
     return parsed.astimezone(timezone.utc)
+
+
+def quantile(values: list[float], probability: float) -> float | None:
+    """Nearest-rank quantile: sorted[ceil(p*n)-1]."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, math.ceil(probability * len(ordered)) - 1)
+    return round(ordered[index], 3)
 
 
 def sha256_file(path: str | Path) -> str:
