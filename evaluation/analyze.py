@@ -112,7 +112,8 @@ def _forecast_metrics(actual_records: list[dict], forecast_records: list[dict]) 
                     predictions[(row.get("function_id"), prediction.get("bucket_start"))] = float(count)
         else:
             start = row.get("forecast_bucket_start", row.get("bucket_start"))
-            count = row.get("forecast_request_count", row.get("invocation_count"))
+            count = row.get("forecast_invocation_count",
+                            row.get("forecast_request_count", row.get("invocation_count")))
             if start is not None and isinstance(count, (int, float)):
                 predictions[(row.get("function_id"), start)] = float(count)
     errors = [predictions[key] - actual[key] for key in actual.keys() & predictions.keys()]
@@ -197,6 +198,14 @@ def summarize_run(run_dir: str | Path, require_telemetry: bool = False) -> dict:
     controller_path = run_dir / "scheduler_manifest.json"
     if require_telemetry and manifest.get("policy") == "predictive" and not controller_path.is_file():
         raise ValueError(f"{run_dir}: predictive run has no scheduler_manifest.json")
+    if controller_path.is_file():
+        controller = json.loads(controller_path.read_text())
+        if controller.get("final") is False:
+            raise ValueError(f"{run_dir}: controller snapshot is not final; run evaluation.finalize after shutdown")
+    for name, expected_hash in manifest.get("controller_artifacts", {}).items():
+        artifact = run_dir / name
+        if not artifact.is_file() or sha256_file(artifact) != expected_hash:
+            raise ValueError(f"{run_dir}: controller artifact hash mismatch: {name}")
     labels = classify_exposure(requests, lifecycle)
     concurrency = (manifest.get("metadata") or {}).get("container_concurrency", 1)
     if not isinstance(concurrency, (int, dict)) or isinstance(concurrency, bool) or concurrency == 0:
