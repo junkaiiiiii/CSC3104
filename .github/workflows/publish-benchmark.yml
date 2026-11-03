@@ -22,6 +22,8 @@ jobs:
           python-version: "3.12"
       - name: Check benchmark measurement semantics
         run: python scripts/smoke_benchmark.py
+      - name: Check benchmark shutdown and active request draining
+        run: python -m unittest discover -s scripts -p 'test_benchmark_shutdown.py'
       - name: Set up architecture emulation
         uses: docker/setup-qemu-action@v3
       - name: Set up Buildx
@@ -43,10 +45,14 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/junkaiiiiii/CSC3104
             org.opencontainers.image.revision=${{ github.sha }}
+      - name: Verify published image shutdown on runner architecture
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: python scripts/check_container_shutdown.py --image "ghcr.io/junkaiiiiii/csc3104-benchmark@$IMAGE_DIGEST" --output results/shutdown/published.json
       - name: Record image reference
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           echo "Image tag: ghcr.io/junkaiiiiii/csc3104-benchmark:sha-$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
           echo "Pinned image: ghcr.io/junkaiiiiii/csc3104-benchmark@$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
-          echo "Platforms built: linux/amd64, linux/arm64. Runtime smoke check ran on the runner host; cluster pull and container checks remain required." >> "$GITHUB_STEP_SUMMARY"
+          echo "Platforms built: linux/amd64, linux/arm64. Host measurement tests and runner-native container shutdown check passed; other-architecture runtime and cluster checks remain required." >> "$GITHUB_STEP_SUMMARY"
