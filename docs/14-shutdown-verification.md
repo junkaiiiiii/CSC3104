@@ -23,12 +23,20 @@ summary, not an independently downloadable raw-data archive.
 | --- | --- | --- |
 | Standalone Docker stop, 10-second deadline | 10.160 s; exit 137; OOMKilled false | local build: 0.136 s; exit 0 |
 | Published image Docker stop on Mac | Not retested | 0.139 s; exit 0; passed true |
-| Knative observed terminating-to-gone | Around 302 s in earlier pilots | 28.999 s and 28.987 s across two Pods |
+| Knative observed terminating-to-gone, periodic | Around 302 s in earlier pilots | 28.999 s and 28.987 s across two Pods |
+| Knative observed terminating-to-gone, steady | Around 302 s in earlier pilots | 28.997 s for one Pod |
+| Knative observed terminating-to-gone, sparse | Around 302 s in earlier pilots | 28.997 s for one Pod |
 
 Knative verification used `periodic-00002`, served request ID
 `shutdown-check-1`, and then scaled to zero. The collector reported:
 1 request counted, 0 duplicates, 0 late, 0 quarantined, 8 Pod events,
 and conservation OK. No periodic Pods remained at the end.
+
+Subsequent checks served `shutdown-steady-1` from `steady-00002` and
+`shutdown-sparse-1` from `sparse-00002`. The dedicated collector run
+`shutdown-steady-sparse-1` counted both requests with 0 duplicates, 0 late,
+0 quarantined, 8 Pod events, and conservation OK. Both Pods disappeared;
+observed terminating-to-gone duration was 28.997 s for each.
 
 Raw evidence locations, relative to Jun Kai's repository root:
 
@@ -37,6 +45,8 @@ Raw evidence locations, relative to Jun Kai's repository root:
 - `results/shutdown/published-arm64.json`
 - `telemetry/data/shutdown-knative-1/pod_lifecycle.jsonl`
 - Full collector output under `telemetry/data/shutdown-knative-1/`
+- `telemetry/data/shutdown-steady-sparse-1/pod_lifecycle.jsonl`
+- Full collector output under `telemetry/data/shutdown-steady-sparse-1/`
 
 Back up these ignored artifacts outside Git, preserving their original contents.
 No durable raw-evidence link has been recorded yet.
@@ -48,15 +58,16 @@ rather than waiting for Docker's force-kill deadline. Native regressions cover
 idle SIGTERM/SIGINT, stopping during initialization, and completing an active
 response and its invocation event after repeated SIGTERM.
 
-The roughly 90% reduction in observed Pod termination time is a two-Pod diagnostic
-comparison, not a repeated controlled benchmark. The Python base changed between
+The roughly 90% reduction in observed Pod termination time is a four-Pod diagnostic
+comparison across three functions, not a repeated controlled benchmark. The Python base changed between
 the original image and the fixed image; the new base is now pinned. Lifecycle
 durations are based on polling, and the remaining roughly 29 seconds have not been
 isolated by container. Do not attribute the whole residual delay to queue-proxy.
 
 The published image passed a runner-native shutdown check in GitHub Actions and
-the published ARM64 check on the Mac. Cluster validation so far covers periodic;
-steady and sparse still need deployment and verification on the new digest.
+the published ARM64 check on the Mac. All three functions now have matching
+latest-created/latest-ready `00002` revisions using the new digest, served their
+diagnostic requests, and completed observed scale-to-zero Pod deletion.
 
 ## Repeating the application check
 
