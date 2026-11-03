@@ -1,5 +1,5 @@
 # Version lock (CORE-01)
-Tested on Windows.
+Initial infrastructure validation: Windows. Shutdown verification below: Jun Kai's Apple Silicon Mac.
 
 ## Pinned by files in this repo
 
@@ -10,7 +10,7 @@ Tested on Windows.
 | Knative Serving | v1.23.0 (release `knative-v1.23.0`) | `scripts/up.sh` |
 | Kourier ingress | v1.23.0 (release `knative-v1.23.0`) | `scripts/up.sh` |
 | Install method | Plain release YAML, not the Knative Operator | `scripts/up.sh` |
-| Benchmark image | `ghcr.io/junkaiiiiii/csc3104-benchmark@sha256:b410b379a4a333380a57dfd4e35cd87d9ddc0ca57ea50c0db99bc2ba99e01bbc` | `knative/periodic.yaml`, `steady.yaml`, `sparse.yaml` (source: `docs/11-benchmark-image-handover.md`) |
+| Benchmark image | `ghcr.io/junkaiiiiii/csc3104-benchmark@sha256:08b3dc54461c0687c76e867a71b7c11955d7c1580133a89ad02ebb3fc5904c4e` | `knative/periodic.yaml`, `steady.yaml`, `sparse.yaml` (source: `docs/14-shutdown-verification.md`) |
 | Function settings | KPA class, min-scale 0, max-scale 4, containerConcurrency 1, request 100m CPU / 128Mi, limit 1 CPU / 256Mi | `knative/*.yaml` |
 | Ingress class | `kourier.ingress.networking.knative.dev` | `knative/patches/ingress-class.json` |
 | Kourier exposure | NodePort 31080, mapped to `127.0.0.1:8080` on the host | `knative/patches/nodeport.json`, `kind/cluster.yaml` |

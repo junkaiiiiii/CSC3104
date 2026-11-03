@@ -18,6 +18,8 @@ jobs:
           python -c "import json,pathlib; [json.loads(p.read_text()) for p in pathlib.Path('contracts').glob('*.json')]"
       - name: Check measurement semantics
         run: python scripts/smoke_benchmark.py
+      - name: Check benchmark shutdown and active request draining
+        run: python -m unittest discover -s scripts -p 'test_benchmark_shutdown.py'
       - name: Test evaluation harness
         run: python -m unittest evaluation.tests.test_evaluation
       - name: Scheduler tests
@@ -30,3 +32,5 @@ jobs:
         run: python -m unittest discover -s predictor/test -t .
       - name: Build benchmark image
         run: docker build -t csc3104-benchmark:ci functions/benchmark
+      - name: Verify container PID 1 exits on SIGTERM
+        run: python scripts/check_container_shutdown.py --image csc3104-benchmark:ci --output results/shutdown/ci.json
