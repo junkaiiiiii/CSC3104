@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 
 from prewarm import main as cli
@@ -83,6 +84,27 @@ class ReplayTests(unittest.TestCase):
         self.run_cli("same")
         with self.assertRaises(SystemExit):
             self.run_cli("same")
+
+    def test_manifest_exists_before_first_tick_and_is_final_after_shutdown(self):
+        original = cli.Scheduler.tick
+        observed = []
+
+        def check(scheduler, now):
+            path = os.path.join(self.tmp, "startup", "scheduler_manifest.json")
+            with open(path) as stream:
+                initial = json.load(stream)
+            self.assertFalse(initial["final"])
+            self.assertIsNone(initial["ended_at"])
+            observed.append(True)
+            return original(scheduler, now)
+
+        with patch.object(cli.Scheduler, "tick", check):
+            out, _ = self.run_cli("startup")
+        self.assertTrue(observed)
+        with open(os.path.join(out, "scheduler_manifest.json")) as stream:
+            final = json.load(stream)
+        self.assertTrue(final["final"])
+        self.assertIsNotNone(final["ended_at"])
 
 
 class TailTests(unittest.TestCase):

@@ -13,7 +13,7 @@ spec:
     spec:
       containerConcurrency: 1
       containers:
-        - image: ghcr.io/junkaiiiiii/csc3104-benchmark@sha256:b410b379a4a333380a57dfd4e35cd87d9ddc0ca57ea50c0db99bc2ba99e01bbc
+        - image: ghcr.io/junkaiiiiii/csc3104-benchmark@sha256:08b3dc54461c0687c76e867a71b7c11955d7c1580133a89ad02ebb3fc5904c4e
           ports:
             - containerPort: 8080
           env:

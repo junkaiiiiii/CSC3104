@@ -5,7 +5,8 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from evaluation.analyze import analyze, summarize_run
+from evaluation.analyze import analyze, summarize_run, _forecast_metrics
+from evaluation.finalize import finalize
 from evaluation.common import iso_utc, parse_utc, sha256_file, write_json, write_jsonl
 from evaluation.correlate import (classify_exposure, exposure_summary, idle_replica_seconds,
                                   scheduling_lag_summary)
@@ -14,6 +15,34 @@ from evaluation.workload import generate, generate_trace
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_scores_predictor_field_including_zero_forecast(self):
+        actual = [{"function_id": "periodic", "bucket_start": "t", "invocation_count": 4, "complete": True}]
+        forecast = [{"function_id": "periodic", "forecast_bucket_start": "t", "forecast_invocation_count": 3}]
+        self.assertEqual(_forecast_metrics(actual, forecast)["mae"], 1)
+        forecast[0]["forecast_invocation_count"] = 0
+        self.assertEqual(_forecast_metrics(actual, forecast)["mae"], 4)
+
+    def test_finalization_refuses_live_scheduler_then_copies_and_hashes_final_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, controller = Path(temporary) / "run", Path(temporary) / "controller"
+            run.mkdir()
+            controller.mkdir()
+            write_json(run / "run_manifest.json", {"run_id": "p1", "policy": "predictive"})
+            manifest = {"run_id": "p1", "final": False, "ended_at": None}
+            write_json(controller / "scheduler_manifest.json", manifest)
+            with self.assertRaisesRegex(ValueError, "stop the scheduler"):
+                finalize(run, controller)
+            manifest.update(final=True, ended_at="2026-11-03T12:00:00Z")
+            write_json(controller / "scheduler_manifest.json", manifest)
+            for name in ("decisions.jsonl", "actuation.jsonl"):
+                (controller / name).write_text("{}\n")
+            hashes = finalize(run, controller)
+            final = json.loads((run / "run_manifest.json").read_text())
+            self.assertTrue(final["controller_artifacts_final"])
+            self.assertEqual(hashes, final["controller_artifacts"])
+            for name, digest in hashes.items():
+                self.assertEqual(sha256_file(run / name), digest)
+
     def test_workload_generation_is_repeatable_and_has_three_functions(self):
         first = generate_trace(17, 60)
         second = generate_trace(17, 60)

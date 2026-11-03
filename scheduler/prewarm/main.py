@@ -199,6 +199,31 @@ def main(argv=None):
     signal.signal(signal.SIGINT, _interrupt)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, _interrupt)
+    def write_manifest(final):
+        manifest = {
+            "final": final,
+            "run_id": args.run_id, "started_at": format_ts(started),
+            "ended_at": format_ts(datetime.now(timezone.utc)) if final else None,
+            "clock": "replay" if args.replay else "wall", "replay": args.replay,
+            "functions": functions, "actuator": actuator.name, "forecasts": args.forecasts,
+            "namespace": args.namespace, "kube_context": args.kube_context,
+            "policy": config.to_dict(), "forecasts_accepted": scheduler.book.accepted,
+            "predictor_format_rules": {
+                "history_end": "forecast_bucket_start",
+                "generated_at": "actual generated_at for shared records; legacy records use forecast_bucket_start + forecast_delay_s",
+                "predictions": "forecast count for forecast_bucket_start and the next bucket",
+                "valid_until": "forecast_bucket_start + 2 x interval",
+                "forecast_delay_s": args.forecast_delay},
+            "totals": dict(sorted(scheduler.stats.items())),
+            "kube_api_calls": getattr(client, "calls", 0),
+            "platform_reverts": getattr(actuator, "reverts", 0),
+        }
+        temporary = os.path.join(out_dir, "scheduler_manifest.json.tmp")
+        with open(temporary, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2)
+        os.replace(temporary, os.path.join(out_dir, "scheduler_manifest.json"))
+
+    write_manifest(final=False)
     last = started
     try:
         if args.replay:
@@ -219,25 +244,7 @@ def main(argv=None):
         _say("stopping: restoring original min-scale values")
     finally:
         scheduler.shutdown(last if args.replay else datetime.now(timezone.utc))
-        manifest = {
-            "run_id": args.run_id, "started_at": format_ts(started),
-            "ended_at": format_ts(datetime.now(timezone.utc)),
-            "clock": "replay" if args.replay else "wall", "replay": args.replay,
-            "functions": functions, "actuator": actuator.name, "forecasts": args.forecasts,
-            "namespace": args.namespace, "kube_context": args.kube_context,
-            "policy": config.to_dict(), "forecasts_accepted": scheduler.book.accepted,
-            "predictor_format_rules": {
-                "history_end": "forecast_bucket_start",
-                "generated_at": "forecast_bucket_start + forecast_delay_s",
-                "predictions": "forecast count for forecast_bucket_start and the next bucket",
-                "valid_until": "forecast_bucket_start + 2 x interval",
-                "forecast_delay_s": args.forecast_delay},
-            "totals": dict(sorted(scheduler.stats.items())),
-            "kube_api_calls": getattr(client, "calls", 0),
-            "platform_reverts": getattr(actuator, "reverts", 0),
-        }
-        with open(os.path.join(out_dir, "scheduler_manifest.json"), "w", encoding="utf-8") as fh:
-            json.dump(manifest, fh, indent=2)
+        write_manifest(final=True)
         _say("wrote %s" % out_dir)
     return 0
 
