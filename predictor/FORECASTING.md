@@ -197,6 +197,77 @@ actual publication timestamps rather than the offline backtest's assumed delay.
 The shadow profile and dataset must still be checked on live traffic. Do not merge
 or actuate merely because the synthetic comparison or contract test passes.
 
+## Measured live shadow results on Jun Kai's Mac
+
+The initial mixed-model shadow run `forecast-shadow-317` used five-second buckets,
+a ten-second collector grace, six forecast horizons and a five-second lead deadline.
+The ten-minute replay matched 693 of 693 requests, with 693 successes and no timeouts.
+After the declared 90-second training prefix, periodic recall was 0.8049 with five
+false-positive buckets; steady recall was 1.0; sparse recall was 0.4211. This run had
+no simultaneous baseline and is not used to claim improvement over SMA.
+
+The subsequent paired run `forecast-paired-318` ran mixed models and SMA concurrently
+against the same collector file and actual traffic. Both predictors used six
+five-second horizons. The scheduler remained stopped; Knative was reactive.
+Client replay window: 2026-11-04T03:47:33Z to 2026-11-04T03:57:33Z. Validation matched
+593 of 593 requests, all successful, with zero timeouts; 15 Pods were observed.
+
+Actual forecast timestamps were scored using `predictor.score_live` with a
+five-second required lead. Both predictors covered all 101 scored buckets per
+function after the 90-second training prefix, and all 119 per function over the
+full replay window. Complete buckets had to fit fully inside each scoring window.
+Availability is distinct from correct positive-demand detection.
+
+### After excluding the 90-second training prefix
+
+| Function | SMA MAE | Mixed MAE | SMA recall | Mixed recall | SMA false positives | Mixed false positives | SMA missed active | Mixed missed active |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Periodic | 1.3759 | 0.9736 | 0.8780 | 0.8049 | 31 | 14 | 5 | 8 |
+| Steady | 1.2273 | 1.1727 | 1.0000 | 1.0000 | 7 | 7 | 0 | 0 |
+| Sparse | 0.8740 | 0.8740 | 0.3182 | 0.3182 | 5 | 5 | 15 | 15 |
+
+Periodic MAE fell 29.2% and false-positive buckets fell 54.8%, but there were three
+additional missed active buckets. Steady MAE fell 4.4%, with identical demand
+classification after training. Sparse is intentionally SMA in both configurations,
+and its scores were identical.
+
+### Full replay, including startup
+
+| Function | SMA MAE | Mixed MAE | SMA recall | Mixed recall | SMA false positives | Mixed false positives | SMA missed active | Mixed missed active |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Periodic | 1.4115 | 1.0336 | 0.8600 | 0.7600 | 33 | 14 | 7 | 12 |
+| Steady | 1.2014 | 1.1431 | 0.9720 | 0.9813 | 7 | 7 | 3 | 2 |
+| Sparse | 0.7529 | 0.7529 | 0.3043 | 0.3043 | 5 | 5 | 16 | 16 |
+
+### Interpretation and owner handoff
+
+This is one paired live *forecasting* run, not a policy latency/resource experiment
+and not a statistically established improvement. The mixed periodic model trades
+fewer false positives for lower recall. More missed active buckets could be costly
+for cold starts; it must not be promoted as an unconditional pre-warming win.
+No thresholds or parameters were retuned on seed 318 after viewing the scores.
+Repeat the frozen settings on fresh seeds before selecting a model for actuation.
+
+The candidate stays optional: default SMA behavior is retained. Isaac owns any
+scheduler policy tradeoff or actuation decision, and Hasan owns repeated policy
+evaluation and latency/resource conclusions. Their files remain unchanged. Neither
+lower MAE nor fewer false positives alone demonstrates lower resource consumption,
+fewer cold starts, or superiority to Lambda.
+
+Raw files remain in ignored directories on Jun Kai's Mac; the values above were
+reported in terminal output and have not been independently read from his disk:
+
+- `results/forecast-paired-318/` (client records, manifest and validation)
+- `telemetry/data/forecast-paired-318/`
+- `predictor/data/paired-mixed-318/forecasts.jsonl`
+- `predictor/data/paired-sma-318/forecasts.jsonl`
+- `results/forecast-development/paired-318-mixed-warmup-0.json`
+- `results/forecast-development/paired-318-mixed-warmup-90.json`
+- `results/forecast-development/paired-318-sma-warmup-0.json`
+- `results/forecast-development/paired-318-sma-warmup-90.json`
+
+Back up the raw files outside Git. No durable raw-artifact link has been recorded.
+
 ## References
 
 The seasonal approach is a mean across matching past phases, extending the seasonal
