@@ -75,7 +75,9 @@ class SMAPredictor(BasePredictor):
     def predict_horizons(self, function_id, horizons=2):
         if horizons < 1:
             raise ValueError("horizons must be positive")
-        result = self.predict_next(function_id)
+        # Use the baseline explicitly; subclasses expose their own predict_next
+        # through predict_horizons and must not recurse through this fallback.
+        result = SMAPredictor.predict_next(self, function_id)
         if result is None:
             return None
         return {**result, "model": f"sma-w{self.window_size}",
@@ -121,6 +123,9 @@ class EWMAPredictor(SMAPredictor):
                 "horizon_methods": ["ewma"] * horizons,
                 "smoothing_state": {**self.state[function_id], "level": self.levels[function_id]}}
 
+    def predict_next(self, function_id):
+        return self.predict_horizons(function_id, 1)
+
 
 class SeasonalPredictor(SMAPredictor):
     """Average observed counts at the same phase in the previous cycles.
@@ -164,6 +169,9 @@ class SeasonalPredictor(SMAPredictor):
                 "input_buckets_used": [{"bucket_start": row["bucket_start"],
                                         "invocation_count": row["invocation_count"]}
                                        for row in sorted(used.values(), key=lambda r: self._parse_iso(r["bucket_start"]))]}
+
+    def predict_next(self, function_id):
+        return self.predict_horizons(function_id, 1)
 
 
 def make_predictor(model="sma", window_size=3, alpha=0.3, season_buckets=20, season_cycles=3):

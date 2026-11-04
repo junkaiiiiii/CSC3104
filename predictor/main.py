@@ -105,7 +105,8 @@ def run(args):
             predictor = configured[fn]
             if not predictor.ingest(bucket):
                 continue
-            shared = follow or args.shared_format or args.model != "sma" or bool(overrides)
+            shared = (follow or args.shared_format or args.model != "sma"
+                      or bool(overrides) or args.horizon_buckets != 2)
             pred = (predictor.predict_horizons(fn, args.horizon_buckets) if shared
                     else predictor.predict_next(fn))
             if pred is not None and shared:
