@@ -158,6 +158,45 @@ python3 -m predictor.main --run-id forecast-fine-pilot \
 This example applies the seasonal model to all input functions; use a per-function
 configuration for a mixed workload after tuning it on training data.
 
+## Mixed-model compatibility and live shadow scoring
+
+Jun Kai reproduced both synthetic comparisons on his Mac. The mixed development
+profile produced 2,136 forecasts from seed 101 and the unchanged scheduler accepted
+all 2,136 with zero rejects in a historical dry-run. That verifies the shared data
+interface, not real pre-warming performance.
+
+`configs/shadow-5s.json` is a separate shadow profile for the replay's 30-second
+cycle: six five-second phases for periodic demand, EWMA for steady, SMA for sparse.
+Use it with `--expected-interval 5 --horizon-buckets 6 --follow`. Keep the collector's
+existing ten-second grace initially. Leave the scheduler stopped: the first test
+observes predictions while Knative remains reactive. No image rebuild is needed.
+
+After a fresh ten-minute live replay, stop the predictor and finalize the collector
+normally. Preserve the replay's real environment metadata and validate request/log
+matching. The following forecast-only checker reads the replay window but never
+changes the evaluation run or computes policy latency/resource comparisons:
+
+```bash
+python3 -m predictor.score_live \
+  --actual telemetry/data/forecast-shadow-317/demand_buckets.jsonl \
+  --forecasts predictor/data/forecast-shadow-317/forecasts.jsonl \
+  --run-dir results/forecast-shadow-317 \
+  --warmup-seconds 90 --lead-time 5 \
+  --output results/forecast-development/shadow-317-after-warmup.json
+```
+
+The 90-second training prefix is measured from client replay start, not collector
+startup, so a long idle setup interval cannot stand in for training traffic. Score
+again with `--warmup-seconds 0` and a new filename to disclose startup behavior too.
+Only complete buckets fully inside the scoring window qualify. Each target uses
+the newest forecast published at least five seconds before bucket start; late
+forecasts cannot overwrite an eligible earlier forecast. Missing forecasts count
+as zero/reactive fallback, and report input hashes preserve provenance. This uses
+actual publication timestamps rather than the offline backtest's assumed delay.
+
+The shadow profile and dataset must still be checked on live traffic. Do not merge
+or actuate merely because the synthetic comparison or contract test passes.
+
 ## References
 
 The seasonal approach is a mean across matching past phases, extending the seasonal
