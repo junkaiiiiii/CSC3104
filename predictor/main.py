@@ -4,97 +4,32 @@ import math
 import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional
 
 
-class BasePredictor:
-    def ingest(self, bucket: Dict[str, Any]) -> None:
-        raise NotImplementedError
-    def predict_next(self, function_id: str) -> Optional[Dict[str, Any]]:
-        raise NotImplementedError
-
-
-class SMAPredictor(BasePredictor):
-    def __init__(self, window_size: int = 3):
-        if window_size < 1:
-            raise ValueError("window_size must be positive")
-        self.window_size = window_size
-        self.history: Dict[str, List[Dict[str, Any]]] = {}
-
-    @staticmethod
-    def _parse_iso(ts: str) -> datetime:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-
-    def ingest(self, bucket: Dict[str, Any]) -> bool:
-        if not bucket.get("complete", True):
-            return False
-        func_id = bucket["function_id"]
-        start = self._parse_iso(bucket["bucket_start"])
-        interval = bucket.get("interval_seconds", 30)
-        count = bucket["invocation_count"]
-        if (not isinstance(func_id, str) or not func_id or start.tzinfo is None
-                or isinstance(interval, bool) or not isinstance(interval, int) or interval <= 0
-                or isinstance(count, bool) or not isinstance(count, (int, float))
-                or not math.isfinite(count) or count < 0):
-            raise ValueError("invalid complete demand bucket")
-        previous = self.history.get(func_id, [])
-        if previous:
-            last = previous[-1]
-            last_start = self._parse_iso(last["bucket_start"])
-            if start <= last_start:
-                return False  # repeated or out-of-order data must not train twice
-            if (interval != last.get("interval_seconds", 30)
-                    or start != last_start + timedelta(seconds=interval)):
-                self.history[func_id] = []  # a missing interval is not observed zero demand
-        else:
-            self.history[func_id] = []
-        self.history[func_id].append(bucket)
-        if len(self.history[func_id]) > self.window_size:
-            self.history[func_id] = self.history[func_id][-self.window_size:]
-        return True
-
-    def predict_next(self, function_id: str) -> Optional[Dict[str, Any]]:
-        buckets = self.history.get(function_id, [])
-        if not buckets:
-            return None
-        latest = buckets[-1]
-        latest_start = self._parse_iso(latest["bucket_start"])
-        interval_sec = latest.get("interval_seconds", 30)
-        next_start = (latest_start + timedelta(seconds=interval_sec)).isoformat().replace("+00:00", "Z")
-        counts = [b["invocation_count"] for b in buckets]
-        avg = sum(counts) / len(counts)
-        return {
-            "function_id": function_id,
-            "forecast_bucket_start": next_start,
-            "forecast_invocation_count": round(avg, 2),
-            "window_size": self.window_size,
-            "input_buckets_used": [
-                {"bucket_start": b["bucket_start"], "invocation_count": b["invocation_count"]}
-                for b in buckets
-            ]
-        }
+from .models import BasePredictor, SMAPredictor, make_predictor
 
 
 def live_forecast(prediction, interval, generated_at):
     """Use the shared contract and actual publication time, never inferred past time.
 
-    SMA is held constant over two buckets. The first has already begun when the
-    collector finalises history; the second supplies a genuinely future horizon.
+    Legacy SMA calls hold the count constant over two buckets. Models can supply
+    distinct per-horizon counts; none changes the actual publication timestamp.
     """
     start = SMAPredictor._parse_iso(prediction["forecast_bucket_start"])
     width = timedelta(seconds=interval)
-    end = start + 2 * width
+    counts = prediction.get("horizon_counts", [prediction["forecast_invocation_count"]] * 2)
+    end = start + len(counts) * width
     if generated_at < start or generated_at >= end:
         return None  # historical backlogs must not become live forecasts
     stamp = lambda value: value.isoformat().replace("+00:00", "Z")
     return {
         **prediction,
         "generated_at": stamp(generated_at), "history_end": stamp(start),
-        "interval_seconds": interval, "model": f"sma-w{prediction['window_size']}",
+        "interval_seconds": interval, "model": prediction.get("model", f"sma-w{prediction['window_size']}"),
         "predictions": [
             {"bucket_start": stamp(start + i * width),
-             "invocation_count": prediction["forecast_invocation_count"]}
-            for i in range(2)
+             "invocation_count": count}
+            for i, count in enumerate(counts)
         ],
         "valid_until": stamp(end),
     }
@@ -125,7 +60,14 @@ def input_lines(path, follow=False, poll_interval=0.5):
 
 
 def run(args):
-    predictor: BasePredictor = SMAPredictor(window_size=args.window_size)
+    defaults = {"model": args.model, "window_size": args.window_size, "alpha": args.alpha,
+                "season_buckets": args.season_buckets, "season_cycles": args.season_cycles}
+    # Construct once to validate CLI settings even if no complete input arrives.
+    make_predictor(**defaults)
+    overrides = json.loads(Path(args.model_config).read_text()) if args.model_config else {}
+    if not isinstance(overrides, dict) or any(not isinstance(v, dict) for v in overrides.values()):
+        raise ValueError("model-config must map function IDs to model settings")
+    configured = {fn: make_predictor(**{**defaults, **values}) for fn, values in overrides.items()}
     input_path = Path(args.input)
     run_id = args.run_id
     out_dir = Path("predictor/data") / run_id
@@ -136,6 +78,12 @@ def run(args):
     poll = getattr(args, "poll_interval", 0.5)
     if not math.isfinite(poll) or poll <= 0:
         raise ValueError("poll_interval must be positive and finite")
+    if args.horizon_buckets < 2:
+        raise ValueError("horizon-buckets must be >= 2")
+    if not math.isfinite(args.availability_delay) or args.availability_delay < 0:
+        raise ValueError("availability-delay must be finite and non-negative")
+    if args.expected_interval is not None and args.expected_interval <= 0:
+        raise ValueError("expected-interval must be positive")
 
     # Refuse to overwrite forecasts, including when resuming an old run by mistake.
     with open(out_file, "x", encoding="utf-8") as f_out:
@@ -149,12 +97,25 @@ def run(args):
             except json.JSONDecodeError:
                 print(f"Skip malformed line {line_num}")
                 continue
+            if args.expected_interval is not None and bucket.get("interval_seconds", 30) != args.expected_interval:
+                raise ValueError("input interval does not match --expected-interval")
+            fn = bucket["function_id"]
+            if fn not in configured:
+                configured[fn] = make_predictor(**defaults)
+            predictor = configured[fn]
             if not predictor.ingest(bucket):
                 continue
-            pred = predictor.predict_next(bucket["function_id"])
-            if pred is not None and follow:
+            shared = follow or args.shared_format or args.model != "sma" or bool(overrides)
+            pred = (predictor.predict_horizons(fn, args.horizon_buckets) if shared
+                    else predictor.predict_next(fn))
+            if pred is not None and shared:
+                generated = (datetime.now(timezone.utc) if follow else
+                             SMAPredictor._parse_iso(pred["forecast_bucket_start"]) +
+                             timedelta(seconds=args.availability_delay))
                 pred = live_forecast(pred, bucket.get("interval_seconds", 30),
-                                     datetime.now(timezone.utc))
+                                     generated)
+                if pred is None:
+                    print(f"Skip forecast on line {line_num}: publication time outside valid horizon", flush=True)
             if pred is not None:
                 f_out.write(json.dumps(pred) + "\n")
                 f_out.flush()
@@ -162,10 +123,20 @@ def run(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Per-function demand predictor, SMA baseline")
+    parser = argparse.ArgumentParser(description="Online per-function SMA, EWMA and seasonal demand forecasts")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--input", required=True)
     parser.add_argument("--window-size", type=int, default=3)
+    parser.add_argument("--model", choices=("sma", "ewma", "seasonal"), default="sma")
+    parser.add_argument("--alpha", type=float, default=0.3)
+    parser.add_argument("--season-buckets", type=int, default=20)
+    parser.add_argument("--season-cycles", type=int, default=3)
+    parser.add_argument("--horizon-buckets", type=int, default=2)
+    parser.add_argument("--model-config", help="JSON: function_id -> model parameter overrides")
+    parser.add_argument("--shared-format", action="store_true", help="also emit shared forecast contract in batch mode")
+    parser.add_argument("--availability-delay", type=float, default=10,
+                        help="batch shared records only: simulated publication delay after history ends")
+    parser.add_argument("--expected-interval", type=int, help="fail if input bucket interval differs")
     parser.add_argument("--follow", action="store_true", help="wait for input and follow appended complete lines")
     parser.add_argument("--poll-interval", type=float, default=0.5)
     parser.add_argument("--output", help="forecast output path; must not already exist")
