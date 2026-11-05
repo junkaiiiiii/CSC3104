@@ -1,0 +1,5 @@
+{
+  "periodic": {"model": "seasonal", "season_buckets": 6, "season_cycles": 3},
+  "steady": {"model": "ewma", "alpha": 0.3},
+  "sparse": {"model": "sma", "window_size": 3}
+}

@@ -1,7 +1,13 @@
 # predictor
 Lead: Sook Yee.
 
-Forecast future per-function bucket counts using only historical data. Moving average first; seasonal/ARIMA models later.
+Forecast future per-function bucket counts using only historical data. Supports SMA,
+exponential smoothing and seasonal phase means.
+
+SMA remains the default. Optional EWMA and seasonal phase-mean models, configurable
+forecast horizons, and per-function model settings are now available. See
+[FORECASTING.md](FORECASTING.md) for the forecast-only comparison, measured limits,
+reproducible commands, and the handoff to scheduler/evaluation owners.
 
 ## Run
 All commands run from repo root. Standard library only, Python 3.9+.
