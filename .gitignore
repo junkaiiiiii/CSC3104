@@ -15,3 +15,7 @@ predictor/data/
 
 # scheduler run output
 scheduler/data/
+
+# Local SAM build/configuration output
+.aws-sam/
+samconfig.toml

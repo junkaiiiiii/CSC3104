@@ -1,0 +1,169 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: CSC3104 on-demand Lambda benchmarks; IAM-authenticated Function URLs.
+
+Parameters:
+  Architecture:
+    Type: String
+    Default: arm64
+    AllowedValues: [arm64, x86_64]
+  MemoryMb:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024]
+  InitDelayMs:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 5000
+  WorkDelayMs:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 20000
+  CodeRevision:
+    Type: String
+    Default: development
+    Description: Source commit recorded alongside the separately captured deployed CodeSha256.
+  ExecutionRoleArn:
+    Type: String
+    Default: ''
+    Description: Optional existing Lambda execution role, e.g. an authorised course-lab role.
+  ReservedConcurrency:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 4
+    Description: Zero leaves concurrency unreserved; positive values cap each function if quota permits.
+
+Conditions:
+  CreateExecutionRole: !Equals [!Ref ExecutionRoleArn, '']
+  SetReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, 0]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Handler: handler.lambda_handler
+    CodeUri: ../../functions/lambda_benchmark/src/
+    Timeout: 30
+    MemorySize: !Ref MemoryMb
+    Architectures: [!Ref Architecture]
+    Environment:
+      Variables:
+        INIT_DELAY_MS: !Ref InitDelayMs
+        WORK_DELAY_MS: !Ref WorkDelayMs
+        BENCHMARK_CODE_REVISION: !Ref CodeRevision
+    Tags:
+      Project: CSC3104
+      Purpose: on-demand-comparison
+
+Resources:
+  BenchmarkRole:
+    Type: AWS::IAM::Role
+    Condition: CreateExecutionRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BenchmarkLogStreams
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*:*'
+
+  PeriodicFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: PeriodicLogs
+    Properties:
+      Role: !If [CreateExecutionRole, !GetAtt BenchmarkRole.Arn, !Ref ExecutionRoleArn]
+      FunctionName: !Sub '${AWS::StackName}-periodic'
+      AutoPublishAlias: benchmark
+      AutoPublishAliasAllProperties: true
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: FunctionUpdate
+      ReservedConcurrentExecutions: !If [SetReservedConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      FunctionUrlConfig:
+        AuthType: AWS_IAM
+        InvokeMode: BUFFERED
+      Environment:
+        Variables:
+          FUNCTION_ID: periodic
+
+  SteadyFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: SteadyLogs
+    Properties:
+      Role: !If [CreateExecutionRole, !GetAtt BenchmarkRole.Arn, !Ref ExecutionRoleArn]
+      FunctionName: !Sub '${AWS::StackName}-steady'
+      AutoPublishAlias: benchmark
+      AutoPublishAliasAllProperties: true
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: FunctionUpdate
+      ReservedConcurrentExecutions: !If [SetReservedConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      FunctionUrlConfig:
+        AuthType: AWS_IAM
+        InvokeMode: BUFFERED
+      Environment:
+        Variables:
+          FUNCTION_ID: steady
+
+  SparseFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: SparseLogs
+    Properties:
+      Role: !If [CreateExecutionRole, !GetAtt BenchmarkRole.Arn, !Ref ExecutionRoleArn]
+      FunctionName: !Sub '${AWS::StackName}-sparse'
+      AutoPublishAlias: benchmark
+      AutoPublishAliasAllProperties: true
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: FunctionUpdate
+      ReservedConcurrentExecutions: !If [SetReservedConcurrency, !Ref ReservedConcurrency, !Ref AWS::NoValue]
+      FunctionUrlConfig:
+        AuthType: AWS_IAM
+        InvokeMode: BUFFERED
+      Environment:
+        Variables:
+          FUNCTION_ID: sparse
+
+  PeriodicLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-periodic'
+      RetentionInDays: 7
+  SteadyLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-steady'
+      RetentionInDays: 7
+  SparseLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-sparse'
+      RetentionInDays: 7
+
+Outputs:
+  PeriodicUrl:
+    Value: !GetAtt PeriodicFunctionUrl.FunctionUrl
+  SteadyUrl:
+    Value: !GetAtt SteadyFunctionUrl.FunctionUrl
+  SparseUrl:
+    Value: !GetAtt SparseFunctionUrl.FunctionUrl
+  PeriodicFunctionName:
+    Value: !Ref PeriodicFunction
+  SteadyFunctionName:
+    Value: !Ref SteadyFunction
+  SparseFunctionName:
+    Value: !Ref SparseFunction
+  PeriodicAliasArn:
+    Value: !Sub '${PeriodicFunction.Arn}:benchmark'
+  SteadyAliasArn:
+    Value: !Sub '${SteadyFunction.Arn}:benchmark'
+  SparseAliasArn:
+    Value: !Sub '${SparseFunction.Arn}:benchmark'

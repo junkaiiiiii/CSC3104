@@ -1,0 +1,6 @@
+# Host-side deployment checks and IAM-signed smoke requests only.
+# The Lambda runtime handler itself uses only the standard library.
+boto3==1.43.124
+botocore==1.43.124
+cfn-lint==1.59.0
+aws-sam-translator==1.116.0
