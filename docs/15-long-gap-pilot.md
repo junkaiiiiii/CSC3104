@@ -68,11 +68,14 @@ compatibility results, not live prewarming or performance evidence.
 - Collector: `--interval 5 --grace 10`.
 - Predictor: `--model-config predictor/configs/long-gap-5s.json`,
   `--expected-interval 5 --horizon-buckets 6 --follow`.
-- Scheduler pilot settings: interval 5 seconds, tick 5 seconds, lead time 5000 ms,
-  cooldown 60 seconds, binary mode, threshold 0.5, per-function cap 2, total budget 6.
-  Use `min-scale`, target `revision`, backend `kubectl`, correct context/namespace.
-  The cooldown and platform scale-down interact: inspect whether capacity is
-  actually released between bursts. Record settings, do not tune them mid-run.
+- Scheduler pilot settings (agreed with Isaac, frozen in
+  `scheduler/configs/long-gap-5s.json`; see [16-scheduler-settings-and-readiness.md](16-scheduler-settings-and-readiness.md)):
+  interval 5 seconds, tick 5 seconds, lead time 5000 ms, cooldown **20** seconds
+  (changed from 60 so the scheduler never holds a Pod longer than Knative's own
+  60-second window would), binary mode, threshold 0.5, per-function cap 2, total budget 6.
+  Use `--config configs/long-gap-5s.json`, `min-scale`, target `revision`, backend
+  `kubectl`, correct context/namespace. Check release between bursts with
+  `scheduler/tools/readiness_timeline.py`. Record settings, do not tune them mid-run.
 - Zero initial Pods, current revisions at min-scale 0, same pinned benchmark image,
   cached images confirmed, unchanged application delays and Docker resources.
 - Run reactive with collector only; predictive with collector, predictor and scheduler.

@@ -1,0 +1,11 @@
+{
+  "interval_seconds": 5,
+  "tick_seconds": 5.0,
+  "lead_time_ms": 5000,
+  "cooldown_seconds": 20.0,
+  "demand_threshold": 0.5,
+  "mode": "binary",
+  "per_function_cap": 2,
+  "total_budget": 6,
+  "max_forecast_age_seconds": 90.0
+}

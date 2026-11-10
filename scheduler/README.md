@@ -28,6 +28,10 @@ A line is rejected if any `input_buckets_used` entry is not before `forecast_buc
 | Actuation spike script | Run on the kind cluster, 26 Oct (CORE-04) |
 | Actuation decision record | [docs/decisions/0001](../docs/decisions/0001-knative-actuation.md), **Accepted**: Revision min-scale, p95 patch→Ready 2.0 s |
 | Live end-to-end run with predictor and evaluation harness | Not done; needs the predictor (CORE-07) and the spike result |
+| Long-gap pilot settings (`configs/long-gap-5s.json`, loaded with `--config`) | Frozen; timing checked offline, not yet live. See [docs/16](../docs/16-scheduler-settings-and-readiness.md) |
+| `tools/timing_check.py`: offline timing simulation with the real predictor + policy | Implemented, tested |
+| `tools/readiness_timeline.py`: live forecast → patch → Ready → request timeline, release, fallback, actuation-failure and shutdown-restore checks | Implemented, tested on fixtures; no live run yet |
+| Automatic stop at replay end (`--stop-when-exists`, `--stop-at`) | Implemented, tested |
 
 The 5000 ms lead time is the spike's p95 patch→Ready (2.0 s) plus a margin. The scheduler loop itself has not yet run against the live cluster.
 
@@ -48,6 +52,15 @@ python -m prewarm.main --run-id dry1 --forecasts path/to/forecasts.jsonl --kube-
 python -m prewarm.main --run-id live1 --forecasts path/to/forecasts.jsonl --kube-context kind-csc3104 \
     --actuator min-scale --target revision --lead-time-ms <measured p95 + margin>
 
+# long-gap pilot: settings from a versioned file (flags still override; hash goes in the manifest)
+python -m prewarm.main --run-id live2 --forecasts path/to/forecasts.jsonl --config configs/long-gap-5s.json \
+    --actuator min-scale --target revision --kube-context kind-csc3104
+
+# offline: will these settings Ready a Pod before each burst? (no cluster)
+python -m tools.timing_check --workload long-gap --seed 401 --cooldown 20   # --sweep for all tick phases
+# after a live run: per-burst forecast -> patch -> Ready -> request timeline
+python -m tools.readiness_timeline --run-dir ../results/<run> --scheduler-dir ../results/scheduler/<run>
+
 # put back every min-scale this scheduler changed (after a crash)
 python -m prewarm.main --restore --kube-context kind-csc3104 --target revision
 
@@ -55,7 +68,10 @@ python -m prewarm.main --restore --kube-context kind-csc3104 --target revision
 python -m spike.actuation_spike --kube-context kind-csc3104 --function periodic \
     --methods revision,pa --trials 3 --out ../results/spike-ab
 ```
-Ctrl-C stops a live run and restores the original min-scale values before exiting.
+Ctrl-C stops a live run and restores the original min-scale values before exiting. So does
+`--stop-when-exists <replay>/run_manifest.json` (stops when the replay finishes),
+`--stop-at <UTC time>` or `--duration <s>`. The manifest records `stop_reason`.
+`tools.readiness_timeline` exits with code 2 if fallback, actuation or shutdown checks fail.
 
 Output goes to `scheduler/data/<run_id>/` (git-ignored):
 

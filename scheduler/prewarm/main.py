@@ -21,6 +21,7 @@ Outputs in scheduler/data/<run_id>/ (git-ignored):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -125,9 +126,15 @@ def build_parser():
     p.add_argument("--max-failures", type=int, default=3)
     p.add_argument("--backoff", type=float, default=60.0)
     p.add_argument("--duration", type=float, help="stop after this many seconds")
+    p.add_argument("--stop-at", help="stop (and restore) at this UTC time, e.g. 2026-11-10T03:18:00Z")
+    p.add_argument("--stop-when-exists", metavar="PATH",
+                   help="stop (and restore) as soon as this file exists, e.g. the replay's "
+                        "run_manifest.json, which evaluation.replay writes after the last response")
     p.add_argument("--replay", nargs=2, metavar=("START", "END"),
                    help="simulated clock over [START, END); forces dry run, no cluster")
     p.add_argument("--restore", action="store_true", help="restore marked min-scale values and exit")
+    p.add_argument("--config", help="JSON file of policy settings (PolicyConfig field names, "
+                                    "e.g. configs/long-gap-5s.json); explicit flags override it")
     defaults = PolicyConfig()
     p.add_argument("--interval", type=int, default=defaults.interval_seconds)
     p.add_argument("--tick", type=float, default=defaults.tick_seconds)
@@ -145,6 +152,47 @@ def build_parser():
                    help="predictor format: seconds after forecast_bucket_start that a forecast "
                         "is assumed to exist (telemetry finalisation grace)")
     return p
+
+
+# PolicyConfig field -> CLI destination. dry_run is decided by the actuator, never a file.
+CONFIG_KEYS = {
+    "interval_seconds": "interval", "tick_seconds": "tick", "lead_time_ms": "lead_time_ms",
+    "per_function_cap": "per_function_cap", "total_budget": "total_budget",
+    "cooldown_seconds": "cooldown", "demand_threshold": "threshold", "mode": "mode",
+    "service_ms": "service_ms", "target_concurrency": "target_concurrency",
+    "target_utilisation": "target_utilisation", "max_forecast_age_seconds": "max_forecast_age",
+}
+
+
+def parse_args(argv=None):
+    """Flags, with defaults taken from --config when given. Returns (args, config file info)."""
+    parser = build_parser()
+    first, _ = parser.parse_known_args(argv)
+    if not first.config:
+        return parser.parse_args(argv), None
+    with open(first.config, "rb") as fh:
+        raw = fh.read()
+    settings = json.loads(raw)
+    if not isinstance(settings, dict):
+        raise SystemExit("%s: expected a JSON object of policy settings" % first.config)
+    unknown = sorted(set(settings) - set(CONFIG_KEYS))
+    if unknown:
+        raise SystemExit("%s: unknown policy settings %s" % (first.config, unknown))
+    parser.set_defaults(**{CONFIG_KEYS[key]: value for key, value in settings.items()})
+    return parser.parse_args(argv), {"path": first.config, "settings": settings,
+                                     "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def should_stop(args, stop_at_wall, deadline, now=None, monotonic=None):
+    """Reason to end a live run, or None. Ending always restores min-scale (shutdown)."""
+    now = now or datetime.now(timezone.utc)
+    if deadline is not None and (monotonic if monotonic is not None else time.monotonic()) >= deadline:
+        return "duration %gs reached" % args.duration
+    if stop_at_wall is not None and now >= stop_at_wall:
+        return "stop time %s reached" % args.stop_at
+    if args.stop_when_exists and os.path.exists(args.stop_when_exists):
+        return "%s appeared (replay finished)" % args.stop_when_exists
+    return None
 
 
 def make_client(args):
@@ -166,7 +214,7 @@ def make_actuator(args, client):
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    args, config_file = parse_args(argv)
     if args.restore:
         client = make_client(args)
         for name, original in restore_namespace(client, args.target):
@@ -185,6 +233,12 @@ def main(argv=None):
         dry_run=bool(args.replay) or args.actuator == "dry-run")
     client = None if args.replay else make_client(args)
     actuator = make_actuator(args, client)
+
+    stop_at_wall = parse_ts(args.stop_at) if args.stop_at else None
+    if args.stop_when_exists and os.path.exists(args.stop_when_exists):
+        raise SystemExit("--stop-when-exists %s already exists; it would stop the scheduler at once "
+                         "(old run? use a fresh run ID)" % args.stop_when_exists)
+    stop = {"reason": None}
 
     out_dir = os.path.join(args.out_dir, args.run_id)
     if os.path.exists(os.path.join(out_dir, "scheduler_manifest.json")):
@@ -207,7 +261,8 @@ def main(argv=None):
             "clock": "replay" if args.replay else "wall", "replay": args.replay,
             "functions": functions, "actuator": actuator.name, "forecasts": args.forecasts,
             "namespace": args.namespace, "kube_context": args.kube_context,
-            "policy": config.to_dict(), "forecasts_accepted": scheduler.book.accepted,
+            "policy": config.to_dict(), "policy_config_file": config_file,
+            "forecasts_accepted": scheduler.book.accepted,
             "predictor_format_rules": {
                 "history_end": "forecast_bucket_start",
                 "generated_at": "actual generated_at for shared records; legacy records use forecast_bucket_start + forecast_delay_s",
@@ -217,6 +272,9 @@ def main(argv=None):
             "totals": dict(sorted(scheduler.stats.items())),
             "kube_api_calls": getattr(client, "calls", 0),
             "platform_reverts": getattr(actuator, "reverts", 0),
+            "stop_conditions": {"duration_s": args.duration, "stop_at": args.stop_at,
+                                "stop_when_exists": args.stop_when_exists},
+            "stop_reason": stop["reason"] if final else None,
         }
         temporary = os.path.join(out_dir, "scheduler_manifest.json.tmp")
         with open(temporary, "w", encoding="utf-8") as fh:
@@ -233,14 +291,26 @@ def main(argv=None):
                 scheduler.tick(now)
                 last = now
                 now += step
+            stop["reason"] = "replay window ended"
         else:
-            stop_at = time.monotonic() + args.duration if args.duration else None
-            while stop_at is None or time.monotonic() < stop_at:
+            deadline = time.monotonic() + args.duration if args.duration else None
+            while True:
                 tick_start = time.monotonic()
                 last = datetime.now(timezone.utc)
                 scheduler.tick(last)
-                time.sleep(max(0.0, args.tick - (time.monotonic() - tick_start)))
+                # Check the stop conditions every 0.5 s, not only once per tick.
+                reason = None
+                while not reason and time.monotonic() - tick_start < args.tick:
+                    reason = should_stop(args, stop_at_wall, deadline)
+                    if not reason:
+                        time.sleep(min(0.5, max(0.0, args.tick - (time.monotonic() - tick_start))))
+                reason = reason or should_stop(args, stop_at_wall, deadline)
+                if reason:
+                    stop["reason"] = reason
+                    _say("stopping: %s; restoring original min-scale values" % reason)
+                    break
     except KeyboardInterrupt:
+        stop["reason"] = "interrupted (Ctrl+C or SIGTERM)"
         _say("stopping: restoring original min-scale values")
     finally:
         scheduler.shutdown(last if args.replay else datetime.now(timezone.utc))
