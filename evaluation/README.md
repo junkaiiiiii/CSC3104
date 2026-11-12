@@ -68,10 +68,28 @@ Outputs:
 
 Latency quantiles use the nearest-rank method. Timeout/error counts are reported separately; latency quantiles use all calls with a recorded duration (including HTTP error responses). First-user-per-process is reported only as a proxy, with unknowns retained. Pod replica-seconds use lifecycle event observation timestamps and may be uncertain by the polling interval. CPU/memory-seconds use Kubernetes **requests**, not utilization. Missing resource/forecast data remains `null`/N/A; it is never silently treated as zero. Forecast scoring supports complete demand buckets and both the shared multi-prediction contract and the current single-prediction format.
 
+## AWS Lambda workload runs
+
+Lambda runs use the same traces and replay client with `--policy lambda`. Every endpoint needs `"auth": "sigv4"` and a `"region"`; requests are signed with the standard AWS credential chain (or `--aws-profile`), are never retried, and credentials are never stored.
+
+```json
+{"periodic": {"url": "https://<id>.lambda-url.us-east-1.on.aws/", "auth": "sigv4", "region": "us-east-1"}}
+```
+
+The `--metadata` file must contain `region`, `runtime`, `architecture`, `memory_mb` and `function_versions`. Then join the run to CloudWatch (allow a few minutes for log delivery):
+
+```bash
+python -m evaluation.replay --trace results/traces/long-gap-402/trace.jsonl --endpoints lambda-endpoints.json --policy lambda --metadata lambda-metadata.json --run-id lambda-402-r1
+python -m evaluation.lambda_correlate fetch --log-group periodic=/aws/lambda/<name> --log-group steady=/aws/lambda/<name> --log-group sparse=/aws/lambda/<name> --start <run started_at> --end <run ended_at + 5 min> --region us-east-1 --output results/lambda-402-r1/reports.jsonl
+python -m evaluation.lambda_correlate correlate --run-dir results/lambda-402-r1 --reports results/lambda-402-r1/reports.jsonl
+```
+
+`correlate` writes `lambda_joined.jsonl` and `lambda_correlation.json`: matched/unmatched/ambiguous/unidentified counts, orphan REPORT records, and HTTP round-trip, execution, initialisation and billed usage (GB-seconds) reported separately. Cost is only estimated when all of `--price-per-gb-second`, `--price-per-million-requests`, `--price-source` and `--price-date` are supplied. Billed usage is not equivalent to Knative replica-seconds, and the client-to-AWS network path differs from localhost ingress.
+
 ## Local verification
 
 ```bash
-python3 -m unittest evaluation.tests.test_evaluation
+python3 -m unittest evaluation.tests.test_evaluation evaluation.tests.test_lambda
 ```
 
 Actual cluster trials still require the platform setup in [infra/README.md](../infra/README.md) and a validated pre-warming control path. See [the evaluation protocol](../docs/05-evaluation.md) for fairness, metrics and success criteria; thresholds should be selected after a pilot and before final runs.

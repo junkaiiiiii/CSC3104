@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import http.client
 import json
 import math
@@ -22,7 +23,7 @@ from pathlib import Path
 
 from .common import git_revision, iso_utc, parse_utc, read_jsonl, sha256_file, write_json, write_jsonl
 
-POLICIES = ("reactive", "fixed_minimum", "predictive")
+POLICIES = ("reactive", "fixed_minimum", "predictive", "lambda")
 
 
 def _load_object(path: str | Path) -> dict:
@@ -43,8 +44,27 @@ def _is_timeout(error: BaseException) -> bool:
     )
 
 
+def make_sigv4_signer(profile: str | None = None):
+    """Return sign(url, region, headers) using the standard AWS credential chain (never stored)."""
+    import boto3
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    credentials = boto3.Session(profile_name=profile).get_credentials()
+    if credentials is None:
+        raise ValueError("no AWS credentials found; configure the intended profile first")
+
+    def sign(url: str, region: str, headers: dict) -> dict:
+        request = AWSRequest(method="GET", url=url, headers={
+            **headers, "X-Amz-Content-SHA256": hashlib.sha256(b"").hexdigest()})
+        SigV4Auth(credentials.get_frozen_credentials(), "lambda", region).add_auth(request)
+        return dict(request.headers)
+
+    return sign
+
+
 def _send_one(event: dict, endpoint: dict, run_id: str, scheduled_at: str,
-              timeout_s: float, origin: float) -> dict:
+              timeout_s: float, origin: float, signer=None) -> dict:
     delay = event["scheduled_at_s"] - (time.monotonic() - origin)
     if delay > 0:
         time.sleep(delay)
@@ -58,6 +78,8 @@ def _send_one(event: dict, endpoint: dict, run_id: str, scheduled_at: str,
     headers["X-Request-Kind"] = event.get("request_kind", "user")
     if endpoint.get("host"):
         headers["Host"] = endpoint["host"]
+    if endpoint.get("auth") == "sigv4":
+        headers = signer(endpoint["url"], endpoint["region"], headers)
     request = urllib.request.Request(endpoint["url"], headers=headers)
     status_code, body, error, timed_out = None, {}, None, False
     try:
@@ -102,16 +124,21 @@ def _send_one(event: dict, endpoint: dict, run_id: str, scheduled_at: str,
         "scheduling_lag_ms": None,
         "init_ms": body.get("init_ms"),
         "service_ms": body.get("service_ms"),
+        "aws_request_id": body.get("aws_request_id"),
     }
 
 
 REQUIRED_METADATA = ("image_digest", "kubernetes_version", "knative_version", "hardware", "image_cache_state")
+LAMBDA_METADATA = ("region", "runtime", "architecture", "memory_mb", "function_versions")
 CACHE_STATES = ("cached", "uncached")
 CONTROLLER_FILES = ("scheduler_manifest.json", "decisions.jsonl", "actuation.jsonl")
 
 
 def validate_metadata(metadata: dict, policy: str) -> list[str]:
     """Return the problems that make a run's environment record insufficient for comparison."""
+    if policy == "lambda":
+        return [f"missing metadata: {key}" for key in LAMBDA_METADATA
+                if metadata.get(key) in (None, "", {}, [])]
     problems = [f"missing metadata: {key}" for key in REQUIRED_METADATA
                 if metadata.get(key) in (None, "", {}, [])]
     state = metadata.get("image_cache_state")
@@ -142,7 +169,8 @@ def _copy_controller_artifacts(controller_dir: str | Path, output_dir: Path) -> 
 def replay(trace_path: str | Path, endpoints_path: str | Path, policy: str, run_id: str,
            output_root: str | Path, max_workers: int = 16, timeout_s: float = 30,
            policy_config_path: str | Path | None = None, metadata_path: str | Path | None = None,
-           require_metadata: bool = False, controller_dir: str | Path | None = None) -> Path:
+           require_metadata: bool = False, controller_dir: str | Path | None = None,
+           aws_profile: str | None = None, signer=None) -> Path:
     if policy not in POLICIES:
         raise ValueError(f"policy must be one of {', '.join(POLICIES)}")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", run_id):
@@ -193,6 +221,14 @@ def replay(trace_path: str | Path, endpoints_path: str | Path, policy: str, run_
         if any(not isinstance(key, str) or not isinstance(value, str)
                for key, value in endpoint.get("headers", {}).items()):
             raise ValueError(f"endpoint headers for {event['function_id']} must contain strings")
+        if endpoint.get("auth") not in (None, "sigv4"):
+            raise ValueError(f"endpoint auth for {event['function_id']} must be sigv4 when set")
+        if endpoint.get("auth") == "sigv4" and (parsed_url.scheme != "https" or not endpoint.get("region")):
+            raise ValueError(f"sigv4 endpoint for {event['function_id']} needs an https URL and a region")
+        if policy == "lambda" and endpoint.get("auth") != "sigv4":
+            raise ValueError(f"lambda runs require auth: sigv4 for {event['function_id']}")
+    if signer is None and any(isinstance(e, dict) and e.get("auth") == "sigv4" for e in endpoints.values()):
+        signer = make_sigv4_signer(aws_profile)
 
     output_dir = Path(output_root) / run_id
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -209,7 +245,7 @@ def replay(trace_path: str | Path, endpoints_path: str | Path, policy: str, run_
             pool.submit(
                 _send_one, event, endpoints[event["function_id"]], run_id,
                 iso_utc(run_started + timedelta(seconds=event["scheduled_at_s"])),
-                timeout_s, origin,
+                timeout_s, origin, signer,
             )
             for event in events
         ]
@@ -266,6 +302,7 @@ def main(argv=None) -> int:
     parser.add_argument("--allow-incomplete-metadata", action="store_true",
                         help="skip the required-metadata and controller-artifact checks (not comparable runs)")
     parser.add_argument("--controller-dir", help="scheduler output dir (scheduler_manifest.json etc.); required for predictive")
+    parser.add_argument("--aws-profile", help="AWS profile for sigv4 endpoints (default credential chain if omitted)")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--output", default="results")
     parser.add_argument("--max-workers", type=int, default=16)
@@ -273,7 +310,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     output = replay(args.trace, args.endpoints, args.policy, args.run_id, args.output,
                     args.max_workers, args.timeout, args.policy_config, args.metadata,
-                    require_metadata=not args.allow_incomplete_metadata, controller_dir=args.controller_dir)
+                    require_metadata=not args.allow_incomplete_metadata, controller_dir=args.controller_dir,
+                    aws_profile=args.aws_profile)
     print(f"Recorded measurements and manifest in {output}")
     return 0
 
