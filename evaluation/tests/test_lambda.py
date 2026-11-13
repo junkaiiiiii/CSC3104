@@ -5,10 +5,11 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
-from evaluation.common import write_json, write_jsonl
-from evaluation.lambda_correlate import correlate, load_reports, parse_report
-from evaluation.replay import _send_one, replay, validate_metadata
+from evaluation.common import read_jsonl, write_json, write_jsonl
+from evaluation.lambda_correlate import correlate, fetch, load_reports, parse_report
+from evaluation.replay import _send_one, _validate_lambda_endpoint, replay, validate_metadata
 
 REPORT = ("REPORT RequestId: {id}\tDuration: {d} ms\tBilled Duration: {b} ms\t"
           "Memory Size: 256 MB\tMax Memory Used: 40 MB{init}\n")
@@ -20,6 +21,74 @@ def report(request_id, duration, billed, init=None):
 
 
 class SignedReplayTests(unittest.TestCase):
+    def test_endpoint_validation_rejects_foreign_or_modified_urls(self):
+        endpoint = {"url": "https://abc.lambda-url.us-east-1.on.aws/", "region": "us-east-1"}
+        _validate_lambda_endpoint(endpoint)
+        for url in ("https://example.com/", "https://abc.lambda-url.us-east-1.on.aws/other",
+                    "https://abc.lambda-url.us-east-1.on.aws/?x=1",
+                    "https://abc.lambda-url.us-west-2.on.aws/"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                _validate_lambda_endpoint({**endpoint, "url": url})
+        with self.assertRaises(ValueError):
+            _validate_lambda_endpoint({**endpoint, "headers": {"Authorization": "secret"}})
+
+    def test_signing_failure_is_recorded_without_secret_or_send(self):
+        event = {"scheduled_at_s": 0, "function_id": "periodic", "request_id": "r1"}
+        endpoint = {"url": "https://example.com/", "auth": "sigv4", "region": "us-east-1"}
+
+        def fail(*args):
+            raise ValueError("credential secret")
+
+        with patch("urllib.request.urlopen") as send:
+            row = _send_one(event, endpoint, "run", "2026-01-01T00:00:00Z", 5, time.monotonic(), fail)
+        send.assert_not_called()
+        self.assertIsNone(row["sent_at"])
+        self.assertIsNone(row["latency_ms"])
+        self.assertEqual(row["error"], "request signing failed: ValueError")
+
+    def test_signed_redirect_is_not_followed(self):
+        visited = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                visited.append(self.path)
+                self.send_response(302)
+                self.send_header("Location", "/redirect-target")
+                self.end_headers()
+
+            def log_message(self, *_):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            event = {"scheduled_at_s": 0, "function_id": "periodic", "request_id": "r1"}
+            endpoint = {"url": f"http://127.0.0.1:{server.server_port}/",
+                        "auth": "sigv4", "region": "us-east-1"}
+            row = _send_one(event, endpoint, "run", "2026-01-01T00:00:00Z", 5, time.monotonic(),
+                            lambda url, region, headers: {**headers, "Authorization": "signed"})
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(row["status_code"], 302)
+        self.assertEqual(visited, ["/"])
+
+    def test_signing_time_is_separate_from_request_latency(self):
+        event = {"scheduled_at_s": 0, "function_id": "periodic", "request_id": "r1"}
+        endpoint = {"url": "http://127.0.0.1/", "auth": "sigv4", "region": "us-east-1"}
+
+        def slow_signer(url, region, headers):
+            time.sleep(0.1)
+            return headers
+
+        with patch("urllib.request.build_opener") as build:
+            response = build.return_value.open.return_value.__enter__.return_value
+            response.status = 200
+            response.read.return_value = b"{}"
+            row = _send_one(event, endpoint, "run", "2026-01-01T00:00:00Z", 5, time.monotonic(), slow_signer)
+        self.assertGreaterEqual(row["signing_ms"], 90)
+        self.assertLess(row["latency_ms"], row["signing_ms"])
+
     def test_signed_headers_are_sent_and_aws_request_id_is_recorded(self):
         seen = {}
 
@@ -70,6 +139,20 @@ class SignedReplayTests(unittest.TestCase):
 
 
 class CorrelationTests(unittest.TestCase):
+    def test_fetch_preserves_all_events_and_requests_unfiltered_pages(self):
+        events = [{"timestamp": 1, "message": "START RequestId: abc", "eventId": "one"},
+                  {"timestamp": 2, "message": report("abc", "1.0", 2), "eventId": "two"}]
+        with tempfile.TemporaryDirectory() as temp, patch("boto3.Session") as session:
+            paginator = session.return_value.client.return_value.get_paginator.return_value
+            paginator.paginate.return_value = [{"events": events}]
+            target = Path(temp) / "logs.jsonl"
+            self.assertEqual(fetch({"periodic": "/aws/lambda/example"}, 0, 10, str(target),
+                                   "us-east-1", "test"), 2)
+            paginator.paginate.assert_called_once_with(logGroupName="/aws/lambda/example",
+                                                      startTime=0, endTime=10)
+            self.assertEqual([r["message"] for r in read_jsonl(target)],
+                             [e["message"] for e in events])
+
     def _run(self, root, clients):
         run = root / "run"
         run.mkdir()

@@ -63,13 +63,34 @@ def make_sigv4_signer(profile: str | None = None):
     return sign
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _validate_lambda_endpoint(endpoint: dict) -> None:
+    region = endpoint.get("region")
+    if not isinstance(region, str) or not re.fullmatch(r"[a-z0-9-]+", region):
+        raise ValueError("sigv4 endpoint needs a valid AWS region")
+    parsed = urlsplit(endpoint["url"])
+    expected = rf"[a-z0-9]+\.lambda-url\.{re.escape(region)}\.on\.aws"
+    try:
+        valid = (parsed.scheme == "https" and re.fullmatch(expected, parsed.hostname or "")
+                 and not parsed.username and not parsed.password and parsed.port in (None, 443)
+                 and parsed.path in ("", "/") and not parsed.query and not parsed.fragment)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("sigv4 endpoint must be a root HTTPS Lambda Function URL in its region")
+    if endpoint.get("host") or endpoint.get("headers"):
+        raise ValueError("sigv4 endpoints cannot specify custom host or headers")
+
+
 def _send_one(event: dict, endpoint: dict, run_id: str, scheduled_at: str,
               timeout_s: float, origin: float, signer=None) -> dict:
     delay = event["scheduled_at_s"] - (time.monotonic() - origin)
     if delay > 0:
         time.sleep(delay)
-    sent_at = iso_utc()
-    started = time.monotonic()
     request_id = f"{run_id}-{event['request_id']}"
     headers = {
         **endpoint.get("headers", {}),
@@ -78,12 +99,26 @@ def _send_one(event: dict, endpoint: dict, run_id: str, scheduled_at: str,
     headers["X-Request-Kind"] = event.get("request_kind", "user")
     if endpoint.get("host"):
         headers["Host"] = endpoint["host"]
-    if endpoint.get("auth") == "sigv4":
-        headers = signer(endpoint["url"], endpoint["region"], headers)
-    request = urllib.request.Request(endpoint["url"], headers=headers)
+    signed = endpoint.get("auth") == "sigv4"
     status_code, body, error, timed_out = None, {}, None, False
+    sent_at, latency_ms, signing_ms = None, None, None
+    payload = b""
     try:
-        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        if signed:
+            signing_started = time.monotonic()
+            try:
+                headers = signer(endpoint["url"], endpoint["region"], headers)
+            except Exception as exception:
+                error = f"request signing failed: {type(exception).__name__}"
+            signing_ms = round((time.monotonic() - signing_started) * 1000, 3)
+        if error:
+            raise RuntimeError(error)
+        request = urllib.request.Request(endpoint["url"], headers=headers)
+        opener = urllib.request.build_opener(_NoRedirect()) if signed else None
+        open_request = opener.open if opener else urllib.request.urlopen
+        sent_at = iso_utc()
+        started = time.monotonic()
+        with open_request(request, timeout=timeout_s) as response:
             status_code = response.status
             payload = response.read()
     except urllib.error.HTTPError as exception:
@@ -94,7 +129,11 @@ def _send_one(event: dict, endpoint: dict, run_id: str, scheduled_at: str,
         payload = b""
         error = str(exception)[:500]
         timed_out = _is_timeout(exception)
-    latency_ms = (time.monotonic() - started) * 1000
+    except RuntimeError:
+        if not error:
+            raise
+    if sent_at is not None:
+        latency_ms = round((time.monotonic() - started) * 1000, 3)
     completed_at = iso_utc()
     if payload:
         try:
@@ -113,7 +152,8 @@ def _send_one(event: dict, endpoint: dict, run_id: str, scheduled_at: str,
         "scheduled_at": scheduled_at,
         "sent_at": sent_at,
         "completed_at": completed_at,
-        "latency_ms": round(latency_ms, 3),
+        "latency_ms": latency_ms,
+        "signing_ms": signing_ms,
         "status_code": status_code,
         "timeout": timed_out,
         "error": error,
@@ -223,8 +263,8 @@ def replay(trace_path: str | Path, endpoints_path: str | Path, policy: str, run_
             raise ValueError(f"endpoint headers for {event['function_id']} must contain strings")
         if endpoint.get("auth") not in (None, "sigv4"):
             raise ValueError(f"endpoint auth for {event['function_id']} must be sigv4 when set")
-        if endpoint.get("auth") == "sigv4" and (parsed_url.scheme != "https" or not endpoint.get("region")):
-            raise ValueError(f"sigv4 endpoint for {event['function_id']} needs an https URL and a region")
+        if endpoint.get("auth") == "sigv4":
+            _validate_lambda_endpoint(endpoint)
         if policy == "lambda" and endpoint.get("auth") != "sigv4":
             raise ValueError(f"lambda runs require auth: sigv4 for {event['function_id']}")
     if signer is None and any(isinstance(e, dict) and e.get("auth") == "sigv4" for e in endpoints.values()):
@@ -256,8 +296,9 @@ def replay(trace_path: str | Path, endpoints_path: str | Path, policy: str, run_
             results.append(record)
     results.sort(key=lambda record: (record["scheduled_at"], record["request_id"]))
     for record in results:
-        record["scheduling_lag_ms"] = round(max(0.0, (
-            parse_utc(record["sent_at"]) - parse_utc(record["scheduled_at"])).total_seconds() * 1000), 3)
+        if record["sent_at"] is not None:
+            record["scheduling_lag_ms"] = round(max(0.0, (
+                parse_utc(record["sent_at"]) - parse_utc(record["scheduled_at"])).total_seconds() * 1000), 3)
     controller_files = _copy_controller_artifacts(controller_dir, output_dir) if controller_dir else {}
     measurements_path = output_dir / "client_measurements.jsonl"
     write_jsonl(measurements_path, results)

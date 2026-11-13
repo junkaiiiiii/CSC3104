@@ -70,7 +70,7 @@ Latency quantiles use the nearest-rank method. Timeout/error counts are reported
 
 ## AWS Lambda workload runs
 
-Lambda runs use the same traces and replay client with `--policy lambda`. Every endpoint needs `"auth": "sigv4"` and a `"region"`; requests are signed with the standard AWS credential chain (or `--aws-profile`), are never retried, and credentials are never stored.
+Lambda runs use the same traces and replay client with `--policy lambda`. Every endpoint needs `"auth": "sigv4"` and a `"region"`; only root HTTPS Lambda Function URLs in that region are accepted, and custom headers and redirects are rejected. Requests are signed with the standard AWS credential chain (or `--aws-profile`), are never retried, and credentials are never stored. `signing_ms` is measured separately; `sent_at` and `latency_ms` begin after signing, immediately before the HTTP request. A signing failure is recorded without a send timestamp or HTTP latency.
 
 ```json
 {"periodic": {"url": "https://<id>.lambda-url.us-east-1.on.aws/", "auth": "sigv4", "region": "us-east-1"}}
@@ -84,7 +84,7 @@ python -m evaluation.lambda_correlate fetch --log-group periodic=/aws/lambda/<na
 python -m evaluation.lambda_correlate correlate --run-dir results/lambda-402-r1 --reports results/lambda-402-r1/reports.jsonl
 ```
 
-`correlate` writes `lambda_joined.jsonl` and `lambda_correlation.json`: matched/unmatched/ambiguous/unidentified counts, orphan REPORT records, and HTTP round-trip, execution, initialisation and billed usage (GB-seconds) reported separately. Cost is only estimated when all of `--price-per-gb-second`, `--price-per-million-requests`, `--price-source` and `--price-date` are supplied. Billed usage is not equivalent to Knative replica-seconds, and the client-to-AWS network path differs from localhost ingress.
+`fetch` saves unfiltered log events, including application, START, END and REPORT records. CloudWatch events may arrive late: check coverage and refetch to a new filename if needed. `correlate` writes `lambda_joined.jsonl` and `lambda_correlation.json`: matched/unmatched/ambiguous/unidentified counts, orphan REPORT records, and HTTP round-trip, execution, initialisation and billed usage (GB-seconds) reported separately. Cost is only estimated when all of `--price-per-gb-second`, `--price-per-million-requests`, `--price-source` and `--price-date` are supplied. Billed usage is not equivalent to Knative replica-seconds, and the client-to-AWS network path differs from localhost ingress.
 
 ## Local verification
 

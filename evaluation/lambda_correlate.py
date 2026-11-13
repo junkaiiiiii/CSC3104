@@ -1,7 +1,7 @@
 """Join Lambda client measurements to CloudWatch REPORT records by aws_request_id.
 
 Subcommands:
-  fetch      download REPORT lines for a time window into a JSONL file (needs AWS credentials)
+  fetch      download CloudWatch log events for a time window (needs AWS credentials)
   correlate  join a replayed lambda run to saved REPORT exports and summarise usage
 
 HTTP round-trip latency, execution duration, initialisation duration and billed usage are
@@ -173,11 +173,11 @@ def fetch(log_groups: dict, start_ms: int, end_ms: int, output: str, region: str
     records = []
     for function_id, group in log_groups.items():
         pages = client.get_paginator("filter_log_events").paginate(
-            logGroupName=group, startTime=start_ms, endTime=end_ms, filterPattern='"REPORT RequestId"')
+            logGroupName=group, startTime=start_ms, endTime=end_ms)
         for page in pages:
             for event in page["events"]:
                 records.append({"function_id": function_id, "log_group": group,
-                                "timestamp": event["timestamp"], "message": event["message"]})
+                                **event})
     write_jsonl(target, records)
     return len(records)
 
@@ -205,7 +205,7 @@ def main(argv=None) -> int:
         groups = dict(item.split("=", 1) for item in args.log_group)
         count = fetch(groups, int(parse_utc(args.start).timestamp() * 1000),
                       int(parse_utc(args.end).timestamp() * 1000), args.output, args.region, args.profile)
-        print(f"Saved {count} REPORT records to {args.output}")
+        print(f"Saved {count} CloudWatch log events to {args.output}")
         return 0
     price_args = (args.price_per_gb_second, args.price_per_million_requests, args.price_source, args.price_date)
     if any(v is not None for v in price_args) and any(v is None for v in price_args):
