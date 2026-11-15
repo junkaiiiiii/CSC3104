@@ -70,9 +70,22 @@ def seconds(a, b):
 def read_jsonl(path):
     path = Path(path)
     if not path.is_file():
-        return []
+        raise ValueError("required evidence file is missing: %s" % path)
     with path.open(encoding="utf-8") as fh:
-        return [json.loads(line) for line in fh if line.strip()]
+        records = []
+        for number, line in enumerate(fh, 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError("%s:%d: invalid JSON" % (path, number)) from exc
+            if not isinstance(record, dict):
+                raise ValueError("%s:%d: expected a JSON object" % (path, number))
+            records.append(record)
+    if not records:
+        raise ValueError("required evidence file is empty: %s" % path)
+    return records
 
 
 # --- Pods -------------------------------------------------------------------------
@@ -115,14 +128,26 @@ def ready_at(spans, function_id, moment):
 
 
 def ready_seconds(spans, function_id, a, b):
-    total = 0.0
+    """Elapsed seconds with at least one Ready Pod, not summed replica-seconds."""
+    intervals = []
     for s in spans:
         if s["function_id"] != function_id:
             continue
-        lo = max(s["ready_from"], a)
-        hi = min(s["ready_to"] or b, b)
+        lo, hi = max(s["ready_from"], a), min(s["ready_to"] or b, b)
         if hi > lo:
-            total += (hi - lo).total_seconds()
+            intervals.append((lo, hi))
+    total = 0.0
+    left = right = None
+    for lo, hi in sorted(intervals):
+        if right is None:
+            left, right = lo, hi
+        elif lo <= right:
+            right = max(right, hi)
+        else:
+            total += (right - left).total_seconds()
+            left, right = lo, hi
+    if right is not None:
+        total += (right - left).total_seconds()
     return round(total, 3)
 
 
@@ -353,12 +378,37 @@ def shutdown_check(actuation, manifest):
             "safe": final and not not_restored and not failed}
 
 
+def evidence_check(requests, lifecycle, decisions, audits, actuation, manifest, functions):
+    """Absent or unusable observations cannot certify a safe run."""
+    problems = []
+    for fn in functions:
+        users = [r for r in requests if r.get("function_id") == fn
+                 and r.get("request_kind", "user") == "user"]
+        if not users or any(parse(r.get("sent_at")) is None
+                            or parse(r.get("completed_at")) is None for r in users):
+            problems.append("%s: missing or invalid user request timestamps" % fn)
+        observations = [r for r in lifecycle if r.get("function_id") == fn]
+        if not observations or any(not r.get("pod") or parse(r.get("observed_at")) is None
+                                   or r.get("event") not in (
+                                       "pod_seen", "pod_ready", "pod_unready",
+                                       "pod_terminating", "pod_gone") for r in observations):
+            problems.append("%s: missing or invalid lifecycle observations" % fn)
+    if manifest.get("policy"):
+        for label, records, time_field in (("decisions", decisions, "decided_at"),
+                                            ("policy audits", audits, "decided_at"),
+                                            ("actuation", actuation, "at")):
+            if not records or any(not r.get("function_id") or parse(r.get(time_field)) is None
+                                  for r in records):
+                problems.append("missing or invalid scheduler %s" % label)
+    return {"complete": not problems, "problems": problems}
+
+
 def build(requests, lifecycle, decisions, audits, actuation, manifest, forecasts=(),
           functions=("periodic",), burst_gap=30.0):
     policy = manifest.get("policy") or {}
     dry_run = bool(policy.get("dry_run", manifest.get("actuator") == "dry-run"))
     spans = pod_spans(lifecycle)
-    have_pods = bool(lifecycle)
+    evidence = evidence_check(requests, lifecycle, decisions, audits, actuation, manifest, functions)
     key = lambda field: (lambda r: parse(r.get(field)) or datetime.min.replace(tzinfo=timezone.utc))
     decisions = sorted(decisions, key=key("decided_at"))
     actuation = sorted(actuation, key=key("at"))
@@ -367,6 +417,8 @@ def build(requests, lifecycle, decisions, audits, actuation, manifest, forecasts
     end = max((e for e in ends if e), default=None)
     bursts, gaps = [], []
     for fn in functions:
+        have_pods = any(r.get("function_id") == fn and r.get("pod")
+                        and parse(r.get("observed_at")) is not None for r in lifecycle)
         found = bursts_of(requests, fn, burst_gap)
         bursts += burst_rows(fn, found, spans, decisions, actuation, forecasts, policy, dry_run, have_pods)
         if have_pods:
@@ -388,7 +440,9 @@ def build(requests, lifecycle, decisions, audits, actuation, manifest, forecasts
         "fallback": fallback,
         "actuation": actuation_report,
         "shutdown": shutdown,
-        "safe": fallback["safe"] and actuation_report["safe"] and (shutdown is None or shutdown["safe"]),
+        "evidence": evidence,
+        "safe": evidence["complete"] and fallback["safe"] and actuation_report["safe"]
+                and (shutdown is None or shutdown["safe"]),
         "resolution_note": "Kubernetes ready_at is 1 s; lifecycle polling adds up to the collector poll interval.",
         "evidence_rule": "Only 'prewarmed' shows a Pod started by the scheduler and Ready before traffic. "
                          "'retained' shows capacity kept from earlier traffic.",
@@ -426,6 +480,9 @@ def markdown(report):
     for problem in a["problems"]:
         lines.append("  - %s %s %s: %s" % (problem.get("at"), problem.get("function_id"),
                                            problem.get("status"), problem.get("detail", "")))
+    lines.append("- Required evidence complete: %s" % report["evidence"]["complete"])
+    for problem in report["evidence"]["problems"]:
+        lines.append("  - %s" % problem)
     if s is None:
         lines.append("- Shutdown: no scheduler in this run")
     else:
@@ -451,21 +508,35 @@ def main(argv=None):
     run = Path(args.run_dir) if args.run_dir else None
     client = args.client or (run and run / "client_measurements.jsonl")
     lifecycle = args.lifecycle or (run and run / "pod_lifecycle.jsonl")
-    if not client:
-        raise SystemExit("--run-dir or --client is required")
+    if not client or not lifecycle:
+        p.error("--run-dir or both --client and --lifecycle are required")
     sched = Path(args.scheduler_dir) if args.scheduler_dir else None
     manifest_path = sched / "scheduler_manifest.json" if sched else None
-    manifest = json.loads(manifest_path.read_text()) if manifest_path and manifest_path.is_file() else {}
-    if sched is None:
-        manifest = {"actuator": "none (reactive)", "run_id": run.name if run else None}
-        sched = Path("__no_scheduler__")
-    lifecycle_rows = read_jsonl(lifecycle) if lifecycle else []
-    if not lifecycle_rows:
-        print("warning: no pod_lifecycle records; readiness cannot be judged", file=sys.stderr)
-    report = build(read_jsonl(client), lifecycle_rows, read_jsonl(sched / "decisions.jsonl"),
-                   read_jsonl(sched / "policy_audit.jsonl"), read_jsonl(sched / "actuation.jsonl"),
-                   manifest, read_jsonl(args.forecasts) if args.forecasts else [],
-                   [f.strip() for f in args.functions.split(",") if f.strip()], args.burst_gap)
+    try:
+        requests, lifecycle_rows = read_jsonl(client), read_jsonl(lifecycle)
+        if sched is not None:
+            if not manifest_path.is_file():
+                raise ValueError("required scheduler manifest is missing: %s" % manifest_path)
+            manifest = json.loads(manifest_path.read_text())
+            if (not isinstance(manifest, dict) or not isinstance(manifest.get("policy"), dict)
+                    or not manifest["policy"] or not manifest.get("run_id")
+                    or not manifest.get("actuator")
+                    or not isinstance(manifest.get("final"), bool)):
+                raise ValueError("%s: incomplete scheduler manifest" % manifest_path)
+            decisions = read_jsonl(sched / "decisions.jsonl")
+            audits = read_jsonl(sched / "policy_audit.jsonl")
+            actuation = read_jsonl(sched / "actuation.jsonl")
+        else:
+            manifest = {"actuator": "none (reactive)", "run_id": run.name if run else None}
+            decisions, audits, actuation = [], [], []
+        forecasts = read_jsonl(args.forecasts) if args.forecasts else []
+    except (OSError, ValueError) as exc:
+        p.error(str(exc))
+    functions = [f.strip() for f in args.functions.split(",") if f.strip()]
+    if not functions:
+        p.error("--functions must contain at least one function")
+    report = build(requests, lifecycle_rows, decisions, audits, actuation, manifest,
+                   forecasts, functions, args.burst_gap)
     text = markdown(report)
     print(text)
     if args.output:
@@ -482,3 +553,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
