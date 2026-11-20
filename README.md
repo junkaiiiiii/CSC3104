@@ -3,13 +3,6 @@ Group 14 · Kubernetes + Knative Serving
 
 Build and evaluate a per-function forecasting controller that prepares capacity before predicted demand. Predictive pre-warming already exists in research; our contribution is the specific policy, Knative integration, and reproducible evaluation.
 
-## Start here
-1. Read [first sprint](docs/01-start-here.md) and [team responsibilities](docs/02-team.md).
-2. Agree on [data contracts](docs/04-contracts.md).
-3. Vania, Isaac, and Hasan complete the actuation feasibility spike before the scheduler is implemented.
-4. Jun Kai builds the benchmark image and CI while Felix and Sook Yee work against the sample contracts.
-5. Track implementation through [task index](docs/07-task-index.md) and GitHub Issues.
-
 ## Project sections
 | Folder | Purpose | Lead |
 |---|---|---|
