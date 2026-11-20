@@ -1,173 +1,203 @@
-# Lambda on-demand comparison setup
+# AWS Lambda benchmark
 
-Owner: Jun Kai (benchmark and infrastructure). This adds Lambda infrastructure and
-read-only verification tools. Isaac's scheduler and Hasan's evaluation code are
-unchanged. Forecasting PR #28 is merged separately. No AWS resources are created by
-local tests or CI; deployment requires your AWS account and local credentials.
+This directory deploys the periodic, steady and sparse benchmark functions to AWS Lambda. The evaluation client supports signed Function URL requests and matches responses to CloudWatch REPORT records.
 
-## What gets deployed
+Jun Kai handled the Lambda application and deployment. Hasan handled workload replay, log correlation and evaluation.
 
-`template.yaml` creates periodic, steady and sparse Lambda functions, a published
-`benchmark` alias for each, IAM-authenticated HTTPS Function URLs, and seven-day log
-groups. It creates one logging-only execution role unless `ExecutionRoleArn` names
-an existing authorised role. Existing roles must already trust Lambda and permit
-the required log operations; the template does not modify their policies.
+## Deployment settings
 
-Defaults: managed Python 3.12, ARM64, 256 MB, 30-second handler timeout, zero
-artificial delays, no Provisioned Concurrency. Runtime updates are applied on
-function update rather than automatically between updates. Capture actual runtime
-versions and do not redeploy during an experiment. This is a managed-runtime ZIP
-deployment, not the same container image or Linux distribution as Knative.
+The SAM template creates three functions, a published `benchmark` alias for each, IAM-authenticated Function URLs and log groups with seven-day retention.
 
-`ReservedConcurrency=0` means leave concurrency unreserved; positive values up to
-four cap **each** function if account quotas allow. Unreserved is not scale-to-zero
-disabled and is not a concurrency cap. Always record the actual setting. The
-256-MB Lambda memory choice does not imply equivalent CPU to Knative's resource
-requests/limits. Use only regions and services permitted by the course account.
+The reported evaluation used us-east-1, Python 3.12, ARM64, 256 MB memory and zero artificial delays. The handler timeout is thirty seconds. Provisioned Concurrency is not configured. This is a managed-runtime ZIP deployment rather than the Knative container image.
 
-## 1. Local verification
+`ReservedConcurrency=0` leaves concurrency unreserved in this template. Positive values, up to four, set a cap for each function. Zero here does not disable invocation.
 
-Commands run from repository root. Python 3.12 is the deployed runtime; SAM's
-container build below also works when the Mac's installed Python version differs.
+## 1. Install the tools and run local checks
+
+Run commands from the repository root. Docker is required for the SAM container build. Install AWS CLI and SAM CLI separately.
 
 ```bash
-python3 -m unittest discover -s functions/lambda_benchmark/tests -v
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r infra/lambda/requirements-tools.txt
+python -m unittest discover -s functions/lambda_benchmark/tests -v
 python -m unittest discover -s infra/lambda/tests -v
+python -m unittest evaluation.tests.test_lambda
 cfn-lint infra/lambda/template.yaml
-```
-
-Host tooling dependencies are pinned separately; the runtime handler has no
-third-party dependencies. Do not put AWS credentials or tokens in the repository.
-Use an existing AWS profile, SSO session or course-issued temporary session locally.
-Do not paste credentials into chat. Verify tools and the intended identity:
-
-```bash
 aws --version
 sam --version
 aws sts get-caller-identity
 ```
 
+Use your own authorised AWS credentials. For a named profile, set `AWS_PROFILE` before running the commands. Learner Lab credentials expire and need refreshing when a new session starts. Local tests do not deploy AWS resources.
+
 ## 2. Build and deploy
 
-Deployment creates billable AWS resources. Review the SAM/CloudFormation change
-set and use the intended course account/region. Example stack name below is short
-enough for the explicit function names; keep stack names under 48 characters.
-The region is an example, not a requirement; use your course's allowed region.
-Append `--profile NAME` to AWS/SAM commands when using a named profile.
+The example below uses AWS Academy's existing LabRole. On another account, substitute an authorised Lambda execution role, or omit the role lookup and `ExecutionRoleArn` parameter to let SAM create the logging role. An existing role must trust Lambda and allow the required log operations.
 
 ```bash
+export AWS_DEFAULT_REGION=us-east-1
+
 sam build --template-file infra/lambda/template.yaml --use-container
+
+ROLE_ARN=$(aws iam get-role --role-name LabRole --query Role.Arn --output text)
 
 sam deploy --guided \
   --template-file .aws-sam/build/template.yaml \
   --stack-name csc3104-lambda \
-  --region ap-southeast-1 \
+  --region us-east-1 \
   --capabilities CAPABILITY_IAM \
-  --parameter-overrides Architecture=arm64 MemoryMb=256 InitDelayMs=0 WorkDelayMs=0 CodeRevision="$(git rev-parse HEAD)"
+  --parameter-overrides Architecture=arm64 MemoryMb=256 \
+    InitDelayMs=0 WorkDelayMs=0 ReservedConcurrency=0 \
+    CodeRevision="$(git rev-parse HEAD)" ExecutionRoleArn="$ROLE_ARN"
 ```
 
-If the course restricts role creation, add `ExecutionRoleArn=YOUR_AUTHORISED_ROLE_ARN`
-to parameter overrides. Do not create or alter a lab role just to bypass account
-restrictions. The conditional IAM resource will be omitted when using an existing
-role. The caller still needs deployment permissions for Lambda, CloudFormation,
-logs, packaging storage and passing that execution role.
+Review the changeset before accepting it. Deployment creates AWS resources and incurs usage. Use a region allowed by the account.
 
-No endpoint is anonymous/public. Function URL callers need both
-`lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` on the relevant benchmark
-alias ARNs. The execution role is not automatically the caller's identity policy.
-Use account-approved permissions; the tools do not modify caller policies.
+Function URLs require IAM-signed requests. Callers need `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` for the benchmark aliases. The function execution role does not automatically grant invocation permission to the caller.
 
-## 3. Verify and record deployment
-
-Save a new snapshot before each experiment; files live under ignored `results/`.
+## 3. Record and check the deployment
 
 ```bash
 python infra/lambda/export_environment.py \
-  --stack csc3104-lambda --region ap-southeast-1 \
+  --stack csc3104-lambda --region us-east-1 \
   --output results/lambda/deployment-1.json
-```
 
-It reads stack outputs, aliases, numbered function versions, CodeSha256, runtime,
-architecture, memory, timeout, concurrency, runtime management and allowed benchmark
-environment values. Arbitrary environment values and credentials are not exported.
-Recheck alias/version before and after experiments: a Function URL backed by an
-alias can change target on a later deployment, despite its URL staying the same.
-
-Find each URL in the stack outputs or snapshot. Run a signed smoke check using its
-actual value and matching function ID; this example uses a shell variable so it
-cannot accidentally invoke a made-up endpoint:
-
-```bash
-PERIODIC_URL=$(aws cloudformation describe-stacks --stack-name csc3104-lambda \
-  --region ap-southeast-1 --query "Stacks[0].Outputs[?OutputKey=='PeriodicUrl'].OutputValue | [0]" --output text)
+PERIODIC_URL=$(python -c 'import json; print(json.load(open("results/lambda/deployment-1.json"))["functions"]["periodic"]["function_url"])')
 
 python infra/lambda/smoke_url.py \
-  --url "$PERIODIC_URL" --region ap-southeast-1 --function-id periodic \
+  --url "$PERIODIC_URL" --region us-east-1 --function-id periodic \
   --output results/lambda/smoke-periodic-1.json
 ```
 
-Repeat for `SteadyUrl`/`steady` and `SparseUrl`/`sparse`, with fresh output filenames.
-The checker uses the AWS SDK's SigV4 signer and local credential chain, refreshes
-temporary credentials and refuses redirects/foreign hosts. Reports contain no
-authorization headers or credentials. Health and two user checks intentionally warm
-execution environments; do not use these three diagnostic times as performance
-results or assume the next invocation will be cold. Do not assume two requests use
-the same execution environment.
+Repeat the smoke check for steady and sparse using their URLs and matching function IDs. The checker sends a health request and two user requests. These calls warm execution environments, so their timings are diagnostic checks rather than performance samples. An unsigned curl is expected to be denied.
 
-An unsigned `curl` to these URLs is expected to be denied. The existing generic
-evaluation replay client does not sign AWS requests; simply substituting these URLs
-into its endpoints file is not a valid Lambda replay integration.
+The deployment snapshot records numbered versions, code hashes, aliases, runtime settings and log groups without exporting credentials. Capture another snapshot after the experiment and check that the versions, aliases and settings have not changed. Use new snapshot filenames each time.
 
-## 4. Handoff for the final comparison
+## 4. Prepare endpoints and replay a trace
 
-Hasan owns workload replay, platform-log correlation, analysis and cost conclusions.
-Isaac owns Knative prediction/actuation. This PR supplies deployable benchmarks and
-verification, not their implementations. Agree the following before formal runs:
-
-- Reuse identical user traces and artificial delay settings; align architecture
-  where available, and disclose resource/network differences. Use version snapshots
-  and CodeSha256 for Lambda, pinned image digests/revisions for Knative.
-- Implement IAM-signed HTTP workload calls with per-request `X-Request-ID` and
-  `X-Request-Kind`. The smoke signer illustrates the SDK call; do not measure CLI
-  startup as function latency. Record whether client signing time is included and
-  keep latency boundaries consistent. Do not send Knative Host headers to Lambda.
-- Capture unfiltered CloudWatch logs for all three snapshot log groups over each
-  run window, including initialization before traffic and delayed log delivery.
-  Preserve raw START/END/REPORT lines and application JSON, then join AWS request
-  IDs to client IDs through application events. Local tests cannot replace this.
-- Use AWS platform initialization evidence rather than first-user flags. Leaving
-  a function idle for an arbitrary time does not guarantee its next request is cold.
-  Report cold-start evidence/unknowns separately from Knative's readiness exposure.
-- Separate user traffic from warm-ups/probes in demand. Lambda health/warm-up
-  invocations can still be billable: retain their overhead when calculating costs.
-- Capture actual billed-duration/memory/initialization fields and service pricing
-  for the chosen date/region. Replica-seconds are not a Lambda invoice. Memory sizes
-  alone do not equalise CPU; one laptop cluster is not equivalent to AWS hardware.
-- Repeat reactive, fixed-minimum, predictive and Lambda on-demand workloads with
-  consistent training windows, seeds and run order. Provisioned Concurrency is an
-  optional later warm-capacity comparison, not implemented by this template.
-
-No Lambda performance or superiority result is established by this setup.
-
-## 5. Cleanup
-
-After exporting and backing up raw evidence, remove this project's stack using the
-same profile and region. Check the proposed deletion before confirming:
+Create endpoint and metadata files from the saved deployment:
 
 ```bash
-sam delete --stack-name csc3104-lambda --region ap-southeast-1
+python - <<'PY'
+import json
+from pathlib import Path
+
+snapshot = json.loads(Path("results/lambda/deployment-1.json").read_text())
+functions = snapshot["functions"]
+config = functions["periodic"]["configuration"]
+for row in functions.values():
+    actual = row["configuration"]
+    assert all(actual[key] == config[key]
+               for key in ("Runtime", "Architectures", "MemorySize"))
+endpoints = {
+    name: {"url": row["function_url"], "auth": "sigv4", "region": snapshot["region"]}
+    for name, row in functions.items()
+}
+metadata = {
+    "region": snapshot["region"],
+    "runtime": config["Runtime"],
+    "architecture": config["Architectures"][0],
+    "memory_mb": config["MemorySize"],
+    "function_versions": {
+        name: {
+            "version": row["version"],
+            "code_sha256": row["configuration"]["CodeSha256"]
+        }
+        for name, row in functions.items()
+    }
+}
+for name, value in (("endpoints", endpoints), ("metadata", metadata)):
+    with Path(f"results/lambda/{name}-1.json").open("x") as stream:
+        json.dump(value, stream, indent=2)
+PY
 ```
 
-SAM packaging storage or logs retained by account policies may require separate
-review. Do not delete shared/course resources. Preserve the evidence before cleanup.
+The metadata uses the deployed runtime, architecture and memory from the snapshot. For the reported configuration these should be Python 3.12, arm64 and 256 MB.
 
-## AWS references
+Use the same long-gap trace as the Knative comparison. Generate it only if it does not already exist:
 
-- [Function URL event/response format and SigV4](https://docs.aws.amazon.com/lambda/latest/dg/urls-invocation.html)
-- [Function URL caller permissions](https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html)
-- [SAM FunctionUrlConfig and alias targeting](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-property-function-functionurlconfig.html)
-- [Python platform REPORT fields](https://docs.aws.amazon.com/lambda/latest/dg/python-logging.html)
-- [Runtime management](https://docs.aws.amazon.com/lambda/latest/dg/runtime-management-configure-settings.html)
+```bash
+python scripts/prepare_long_gap.py --seed 402 --output results/traces/long-gap-402
+```
+
+Replay the saved trace:
+
+```bash
+export RUN=lambda-402-r1
+
+python -m evaluation.replay \
+  --trace results/traces/long-gap-402/trace.jsonl \
+  --endpoints results/lambda/endpoints-1.json --policy lambda \
+  --metadata results/lambda/metadata-1.json --run-id "$RUN"
+```
+
+For a named profile, use `AWS_PROFILE` or add `--aws-profile PROFILE` to replay. Do not include Knative Host headers in the Lambda endpoints.
+
+The client signs requests with SigV4 and does not retry them. It records signing time separately; HTTP latency starts after signing, immediately before sending the request. Each run ID must be new.
+
+## 5. Fetch logs and match execution reports
+
+Allow several minutes for CloudWatch delivery after replay. Derive the log window from the run manifest:
+
+```bash
+read -r START END < <(python - <<'PY'
+import json
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+
+manifest = json.loads((Path("results") / os.environ["RUN"] / "run_manifest.json").read_text())
+def timestamp(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+start = timestamp(manifest["started_at"]) - timedelta(seconds=60)
+end = timestamp(manifest["ended_at"]) + timedelta(minutes=5)
+print(start.isoformat(), end.isoformat())
+PY
+)
+
+python -m evaluation.lambda_correlate fetch \
+  --log-group periodic=/aws/lambda/csc3104-lambda-periodic \
+  --log-group steady=/aws/lambda/csc3104-lambda-steady \
+  --log-group sparse=/aws/lambda/csc3104-lambda-sparse \
+  --start "$START" --end "$END" --region us-east-1 \
+  --output "results/$RUN/cloudwatch-1.jsonl"
+
+python -m evaluation.lambda_correlate correlate \
+  --run-dir "results/$RUN" --reports "results/$RUN/cloudwatch-1.jsonl"
+```
+
+If you used a different stack name, take the log-group names from the deployment snapshot.
+
+The outputs are `lambda_joined.jsonl` and `lambda_correlation.json`. Check that every client request matched a REPORT and that unmatched, ambiguous and no_aws_request_id are zero. Also check HTTP success and timeout counts.
+
+If records are missing, wait and fetch again to a new filename. Use the complete replacement export for correlation. Passing overlapping exports together can create duplicate REPORT IDs.
+
+Repeat with seeds 403-406 and fresh run IDs. Keep each trace identical to its Knative counterpart. Do not redeploy or change aliases during the comparison. Keep raw logs, client records and deployment snapshots outside Git.
+
+## Results and limits
+
+The completed five-seed evaluation matched all 3,475 requests, with no unmatched or ambiguous records. Reported HTTP p95 ranged from 785.285 to 805.334 ms, while execution p95 ranged from 2.450 to 3.300 ms. Matched requests used 2.708 billed GB-seconds in total.
+
+These measurements have different boundaries. HTTP latency includes the remote network path; execution duration comes from CloudWatch. Initialisation evidence comes from AWS Init Duration, not the application's first-user flag. Waiting for an arbitrary idle period does not guarantee a cold invocation.
+
+Billed GB-seconds are billed duration multiplied by configured memory. They are not total monetary cost or directly comparable to Knative Ready replica-seconds. The experiment used on-demand Lambda only and does not establish an advantage over Lambda or Provisioned Concurrency.
+
+See [the evaluation README](../../evaluation/README.md) for metric definitions and cost-estimation options.
+
+## Cleanup
+
+After saving the results, remove the stack created for this experiment:
+
+```bash
+sam delete --stack-name csc3104-lambda --region us-east-1
+```
+
+Check for retained logs or packaging storage separately. Do not delete shared lab resources.
+
+## AWS documentation
+
+- [Function URL invocation](https://docs.aws.amazon.com/lambda/latest/dg/urls-invocation.html)
+- [Function URL permissions](https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html)
+- [Python log and REPORT fields](https://docs.aws.amazon.com/lambda/latest/dg/python-logging.html)
+- [Provisioned Concurrency](https://docs.aws.amazon.com/lambda/latest/dg/provisioned-concurrency.html)
